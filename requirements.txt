@@ -1,0 +1,24 @@
+# 기본 라이브러리
+# numpy==1.24.3
+pandas==2.1.4
+python-dotenv==1.0.0
+requests==2.31.0
+
+# 업비트 API 및 암호화폐 거래
+pyupbit==0.2.31
+ccxt==4.1.64
+
+# 데이터베이스
+
+# 로깅 및 스케줄링
+schedule==1.2.0
+
+# 시간 관련
+python-dateutil==2.8.2
+
+# Streamlit 및 시각화 (대시보드용)
+streamlit==1.28.1
+plotly==5.17.0
+plotly-express==0.4.1
+
+# 추가 유틸리티
