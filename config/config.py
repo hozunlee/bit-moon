@@ -44,7 +44,7 @@ class TradingConfig:
     TICKER: str = "KRW-BTC"   # 거래할 코인 (티커 형식)
     
     # 그리드 거래 설정
-    BASE_PRICE: Optional[float] = 161666500 # 기준 가격 (None이면 현재가로 자동 설정)
+    BASE_PRICE: Optional[float] = 166800000 # 기준 가격 (None이면 현재가로 자동 설정) 1구간 설정
     PRICE_CHANGE: float = 513350.0  # 2% 간격 (최적화)
     MAX_GRID_COUNT: int = 20  # 효율성을 위한 그리드 수 축소
     ORDER_AMOUNT: float = 250000  # 수당 금액 증액 (25만원)
