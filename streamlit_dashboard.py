@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -260,6 +261,9 @@ def get_latest_price():
 def main():
     st.title("📈 업비트 그리드 트레이딩 대시보드")
     
+    # 다른 코인 대시보드로 이동하는 링크 버튼 추가
+    st.link_button("다른 코인 대시보드 가기 (8502)", "http://localhost:8502")
+
     # 스크롤 위치 복원
     restore_scroll_position()
     
@@ -274,11 +278,18 @@ def main():
         price_diff = grid_df['buy_price_target'].iloc[0] - grid_df['buy_price_target'].iloc[1]
         PRICE_CHANGE = abs(price_diff)
     
-    # 각 섹션별 컨테이너 생성
-    metrics_container = st.empty()
-    grid_container = st.empty()
-    trades_container = st.empty()
-    
+    # 탭 UI 구성
+    tab1, tab2, tab3, tab4 = st.tabs(["종합 현황", "그리드 상세", "거래 내역", "성과 분석"])
+
+    with tab1:
+        metrics_container = st.empty()
+    with tab2:
+        grid_container = st.empty()
+    with tab3:
+        trades_container = st.empty()
+    with tab4:
+        st.info("향후 자산 변화 그래프, 기간별 수익 분석 차트 등이 여기에 추가될 수 있습니다.")
+
     # 초기 데이터 로드 및 표시
     update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_container, trades_container)
     
@@ -302,6 +313,7 @@ def update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_cont
     except Exception:
         current_price = None
 
+    # 종합 현황 탭
     with metrics_container.container():
         # 코인명/현재가 출력 (메트릭 위로 이동)
         coin_name = get_coin_name(TICKER)
@@ -398,6 +410,7 @@ def update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_cont
                     delta_text
                 )
     
+    # 그리드 상세 탭
     with grid_container.container():
         # 그리드 현황
         kst = timezone(timedelta(hours=9))
@@ -527,6 +540,7 @@ def update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_cont
         else:
             st.info("현재 활성화된 그리드가 없습니다.")
     
+    # 거래 내역 탭
     with trades_container.container():
         # 거래 내역
         kst = timezone(timedelta(hours=9))

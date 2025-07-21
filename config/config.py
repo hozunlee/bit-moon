@@ -18,22 +18,41 @@ class APIConfig:
     SECRET_KEY: str = os.environ.get("UPBIT_SECRET_KEY", "")
     DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# 기존 리플 설정 
+# # 거래 설정
+# class TradingConfig:
+#     """거래 관련 설정"""
+#     # 기본 코인 설정
+#     TICKER: str = "KRW-XRP"  # 거래할 코인 (티커 형식)
+    
+#     # 그리드 거래 설정
+#     BASE_PRICE: Optional[float] = 3200.0  # 기준 가격 (None이면 현재가로 자동 설정)
+#     PRICE_CHANGE: float = 20.0  # 그리드 간 가격 차이 (원)
+#     MAX_GRID_COUNT: int = 50  # 최대 그리드 수 (1~100)
+#     ORDER_AMOUNT: float = 30000.0  # 주문당 금액 (원, 최소 5,000원)
+    
+#     # 실행 설정
+#     CHECK_INTERVAL: int = 10  # 가격 체크 간격 (초)
+#     FEE_RATE: float = 0.0005  # 거래 수수료 (0.05%)
+    
+
+
 # 거래 설정
 class TradingConfig:
     """거래 관련 설정"""
     # 기본 코인 설정
-    TICKER: str = "KRW-XRP"  # 거래할 코인 (티커 형식)
+    TICKER: str = "KRW-BTC"   # 거래할 코인 (티커 형식)
     
     # 그리드 거래 설정
-    BASE_PRICE: Optional[float] = 3200.0  # 기준 가격 (None이면 현재가로 자동 설정)
+    BASE_PRICE: Optional[float] = None # 기준 가격 (None이면 현재가로 자동 설정)
     PRICE_CHANGE: float = 20.0  # 그리드 간 가격 차이 (원)
     MAX_GRID_COUNT: int = 50  # 최대 그리드 수 (1~100)
-    ORDER_AMOUNT: float = 30000.0  # 주문당 금액 (원, 최소 5,000원)
+    ORDER_AMOUNT: float = 100000 # 주문당 금액 (원, 최소 5,000원)
     
     # 실행 설정
     CHECK_INTERVAL: int = 10  # 가격 체크 간격 (초)
     FEE_RATE: float = 0.0005  # 거래 수수료 (0.05%)
-    
+        
     # 기능 설정
     DISCORD_LOGGING: bool = False  # 디스코드 로깅 사용 여부
     PLAY_SOUND: bool = True  # 소리 알림 사용 여부
