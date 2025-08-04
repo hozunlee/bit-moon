@@ -1,665 +1,242 @@
+"""
+Streamlit 대시보드 (기능 업그레이드 버전)
+- 코인별 ON/OFF, 예산 설정 기능 추가
+- DB 직접 제어 UI 구현
+- 사용자 입력 유효성 검사 및 확인 절차 추가
+"""
 import streamlit as st
 import pandas as pd
-import sqlite3
-import plotly.graph_objects as go
-from datetime import datetime, timedelta, timezone
-import numpy as np
 import time
-import streamlit.components.v1 as components  # JavaScript 실행용
-import glob  # 파일 패턴 검색용
-import os  # 파일 시스템 접근용
-from pathlib import Path
+import os
+import sqlite3
+from datetime import datetime, timezone, timedelta
 
+# --- 모듈 임포트 ---
+from config.config import TradingConfig, DBConfig, TestConfig
+import db_handler as db # handle_config_update에서 pg 용으로 사용
 
-# 설정 가져오기
-from config.config import DBConfig,TradingConfig
+# --- 전역 설정 ---
+REFRESH_INTERVAL = 10
+APP_MODE = os.environ.get("APP_MODE", "PRODUCTION")
 
-# 전역 설정
-REFRESH_INTERVAL = 10  # 자동 새로고침 간격 (초)
+st.set_page_config(page_title="Bit-Moon 트레이딩 대시보드", layout="wide")
 
-# 가장 최근 DB 파일 찾기
-def find_latest_db_file():
+# --- 세션 상태 초기화 ---
+if 'confirming_action' not in st.session_state:
+    st.session_state.confirming_action = None
+if 'action_params' not in st.session_state:
+    st.session_state.action_params = {}
 
-    data_dir = DBConfig.get_db_dir()
-    if not data_dir.exists():
-        return None
-    db_files = list(data_dir.glob('trading_history_*.db'))
+# --- DB 연결 헬퍼 ---
+def get_dashboard_db_connection():
+    """대시보드 모드에 맞는 DB 커넥션을 반환"""
+    if APP_MODE == "TEST":
+        db_path = TestConfig.get_test_db_dir() / "test_mode.db"
+        return sqlite3.connect(db_path)
+    else:
+        # 운영 모드에서는 db_handler의 연결 풀 사용
+        return db.get_connection()
 
-    # """현재 폴더에서 가장 최근의 trading_history_*.db 파일을 찾습니다.""" 
-    # db_files = glob.glob('trading_history_*.db')
-    if not db_files:
-        return None
-    
-    # 파일명으로 정렬 (YYYYMMDDHHMM 형식이므로 파일명 정렬이 시간순 정렬과 같음)
-    db_files.sort(reverse=True)  # 최신 파일이 첫 번째로
-    return db_files[0]
-
-# 데이터베이스 연결
-def get_db_connection():
-    latest_db = find_latest_db_file()
-    if latest_db is None:
-        st.error("trading_history_*.db 파일을 찾을 수 없습니다. 거래 프로그램을 먼저 실행해주세요.")
-        st.stop()
-    
-    return sqlite3.connect(latest_db)
-
-# 스크롤 위치 관리 함수들
-def setup_scroll_save():
-    """스크롤 이벤트 리스너를 설정하여 스크롤할 때마다 즉시 저장"""
-    components.html(
-        """
-        <script>
-        // 스크롤 이벤트 리스너 추가 (중복 방지)
-        if (!window.scrollListenerAdded) {
-            window.addEventListener('scroll', function() {
-                localStorage.setItem('scrollPosition', window.pageYOffset.toString());
-            });
-            window.scrollListenerAdded = true;
-        }
-        </script>
-        """,
-        height=0
-    )
-
-def restore_scroll_position():
-    """저장된 스크롤 위치로 복원 및 스크롤 이벤트 리스너 설정"""
-    components.html(
-        """
-        <script>
-        // 저장된 스크롤 위치로 복원
-        window.onload = function() {
-            setTimeout(function() {
-                const savedPosition = localStorage.getItem('scrollPosition');
-                if (savedPosition) {
-                    window.scrollTo(0, parseInt(savedPosition));
-                }
-            }, 100);
-        };
-        
-        // 페이지가 이미 로드된 경우를 위한 즉시 실행
-        const savedPosition = localStorage.getItem('scrollPosition');
-        if (savedPosition) {
-            setTimeout(function() {
-                window.scrollTo(0, parseInt(savedPosition));
-            }, 100);
-        }
-        
-        // 스크롤 이벤트 리스너 추가 (중복 방지)
-        if (!window.scrollListenerAdded) {
-            window.addEventListener('scroll', function() {
-                localStorage.setItem('scrollPosition', window.pageYOffset.toString());
-            });
-            window.scrollListenerAdded = true;
-        }
-        </script>
-        """,
-        height=0
-    )
-
-# 페이지 설정
-st.set_page_config(
-    page_title="업비트 그리드 트레이딩 대시보드",
-    page_icon="📈",
-    layout="wide"
-)
-
-# TICKER를 데이터베이스에서 가져오는 함수 추가
-def get_current_ticker():
-    """데이터베이스에서 현재 사용 중인 TICKER를 가져옵니다."""
-    conn = get_db_connection()
-    try:
-        # grid 테이블에서 최근 ticker 조회
-        query = "SELECT DISTINCT ticker FROM grid ORDER BY timestamp DESC LIMIT 1"
-        result = pd.read_sql_query(query, conn)
-        if not result.empty:
-            return result['ticker'].iloc[0]
-        
-        # grid가 비어있으면 trades에서 조회
-        query = "SELECT DISTINCT ticker FROM trades ORDER BY timestamp DESC LIMIT 1"
-        result = pd.read_sql_query(query, conn)
-        if not result.empty:
-            return result['ticker'].iloc[0]
-        
-        return TradingConfig.TICKER # DB에 정보가 없으면 config 값 사용
-    except Exception:
-        return TradingConfig.TICKER
-    finally:
+def put_dashboard_db_connection(conn):
+    if APP_MODE != "TEST":
+        db.put_connection(conn)
+    else:
         conn.close()
 
-# 데이터 로드 함수들
-def load_trades(days=7, ticker=None):
-    if ticker is None:
-        ticker = get_current_ticker()
-    
-    conn = get_db_connection()
-    query = f"""
-    SELECT * FROM trades 
-    WHERE timestamp >= datetime('now', '-{days} days')
-    AND ticker = '{ticker}'
-    ORDER BY timestamp DESC
-    """
-    trades_df = pd.read_sql_query(query, conn)
-    conn.close()
-    return trades_df
-
-def load_balance_history(days=7):
-    conn = get_db_connection()
-    query = f"""
-    SELECT * FROM balance_history 
-    WHERE timestamp >= datetime('now', '-{days} days')
-    ORDER BY timestamp ASC
-    """
-    balance_df = pd.read_sql_query(query, conn)
-    conn.close()
-    return balance_df
-
-def get_summary_stats(ticker=None):
-    if ticker is None:
-        ticker = get_current_ticker()
-        
-    conn = get_db_connection()
-    
-    # 전체 거래 통계 (buy_sell 컬럼 사용)
-    trades_query = f"""
-    SELECT 
-        COALESCE(COUNT(*), 0) as total_trades,
-        COALESCE(SUM(CASE WHEN buy_sell = 'buy' THEN 1 ELSE 0 END), 0) as buy_count,
-        COALESCE(SUM(CASE WHEN buy_sell = 'sell' THEN 1 ELSE 0 END), 0) as sell_count,
-        COALESCE(SUM(CASE WHEN buy_sell = 'buy' THEN amount ELSE 0 END), 0) as total_buy_amount,
-        COALESCE(SUM(CASE WHEN buy_sell = 'sell' THEN amount ELSE 0 END), 0) as total_sell_amount,
-        COALESCE(SUM(fee), 0) as total_fees,
-        COALESCE(SUM(profit), 0) as total_profit
-    FROM trades
-    WHERE ticker = '{ticker}'
-    """
-    
-    # 최근 잔고 정보
-    balance_query = """
-    SELECT * FROM balance_history 
-    ORDER BY timestamp DESC LIMIT 1
-    """
-    
-    trades_stats = pd.read_sql_query(trades_query, conn)
-    latest_balance = pd.read_sql_query(balance_query, conn)
-    
-    # 빈 결과인 경우 기본값으로 채우기
-    if trades_stats.empty:
-        trades_stats = pd.DataFrame({
-            'total_trades': [0],
-            'buy_count': [0],
-            'sell_count': [0],
-            'total_buy_amount': [0],
-            'total_sell_amount': [0],
-            'total_fees': [0],
-            'total_profit': [0]
-        })
-    
-    conn.close()
-    return trades_stats, latest_balance
-
-def load_grid_status(ticker=None):
-    """현재 그리드 상태를 가져옵니다."""
-    if ticker is None:
-        ticker = get_current_ticker()
-        
-    conn = get_db_connection()
-    query = f"""
-    WITH latest_grid AS (
-        SELECT 
-            grid_level,
-            buy_price_target,
-            sell_price_target,
-            order_krw_amount,
-            is_bought,
-            actual_bought_volume,
-            actual_buy_fill_price,
-            timestamp,
-            ROW_NUMBER() OVER (PARTITION BY grid_level ORDER BY timestamp DESC) as rn
-        FROM grid 
-        WHERE ticker = '{ticker}'
-    )
-    SELECT 
-        grid_level,
-        buy_price_target,
-        sell_price_target,
-        order_krw_amount,
-        is_bought,
-        actual_bought_volume,
-        actual_buy_fill_price,
-        timestamp
-    FROM latest_grid 
-    WHERE rn = 1
-    ORDER BY grid_level ASC
-    """
-    grid_df = pd.read_sql_query(query, conn)
-    conn.close()
-    return grid_df
-
-def get_coin_name(ticker):
-    coin_names = {
-        "KRW-XRP": "리플",
-        "KRW-BTC": "비트코인",
-        "KRW-ETH": "이더리움",
-        # 필요시 추가
-    }
-    return coin_names.get(ticker, ticker)
-
-def get_latest_price():
-    conn = get_db_connection()
-    query = """
-    SELECT current_price FROM balance_history ORDER BY timestamp DESC LIMIT 1
-    """
-    df = pd.read_sql_query(query, conn)
-    conn.close()
-    if not df.empty:
-        return df['current_price'].iloc[0]
-    return None
-
-def format_korean_won(num, with_space=True):
-    """숫자를 한글 단위(천, 만, 억)로 변환하여 괄호와 함께 문자열로 반환합니다."""
-    if not isinstance(num, (int, float)) or pd.isna(num):
-        return ""
-    
-    num_int = int(num)
-    num_abs = abs(num_int)
-    
-    if num_abs < 1000:
-        return ""
-
-    unit = ""
-    val = 0.0
-    
-    if num_abs >= 100000000:
-        val = num_int / 100000000
-        unit = "억"
-    elif num_abs >= 10000:
-        val = num_int / 10000
-        unit = "만"
-    elif num_abs >= 1000:
-        val = num_int / 1000
-        unit = "천"
-    
-    if val == int(val):
-        formatted_val = f"{int(val)}"
-    else:
-        formatted_val = f"{val:.1f}"
-
-    space = " " if with_space else ""
-    return f"{space}({formatted_val}{unit})"
-
-# 메인 대시보드
-def main():
-    st.title("📈 업비트 그리드 트레이딩 대시보드")
-    
-# 다른 코인 대시보드로 이동하는 링크 버튼 추가
-    st.link_button("다른 코인 대시보드 가기 (8502)", "http://localhost:8502")
-
-    # 스크롤 위치 복원
-    restore_scroll_position()
-    
-    # 동적으로 TICKER 가져오기
-    TICKER = get_current_ticker()
-    
-    # 실제 PRICE_CHANGE 값을 그리드 데이터에서 계산
-    grid_df = load_grid_status(TICKER)
-    PRICE_CHANGE = 2  # 기본값
-    if not grid_df.empty and len(grid_df) >= 2:
-        # 연속된 두 그리드의 매수목표가 차이로 PRICE_CHANGE 계산
-        price_diff = grid_df['buy_price_target'].iloc[0] - grid_df['buy_price_target'].iloc[1]
-        PRICE_CHANGE = abs(price_diff)
-    
-    # 각 섹션별 컨테이너 생성
-    metrics_container = st.empty()
-    grid_container = st.empty()
-    trades_container = st.empty()
-    
-    # 초기 데이터 로드 및 표시
-    update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_container, trades_container)
-    
-    # 자동 업데이트 루프
-    while True:
-        time.sleep(REFRESH_INTERVAL)
-        # 새로운 데이터 로드
-        new_grid_df = load_grid_status(TICKER)
-        # 데이터 업데��트
-        update_dashboard(TICKER, PRICE_CHANGE, new_grid_df, metrics_container, grid_container, trades_container)
-
-def update_dashboard(TICKER, PRICE_CHANGE, grid_df, metrics_container, grid_container, trades_container):
-    """대시보드의 각 섹션을 업데이트"""
-    
-    # 현재가 가져오기
-    current_price = None
+# --- 데이터 로드 함수 ---
+@st.cache_data(ttl=REFRESH_INTERVAL)
+def load_data(ticker: str):
+    """지정된 티커에 대한 모든 데이터를 DB에서 로드합니다."""
+    conn = get_dashboard_db_connection()
     try:
-        _, latest_balance = get_summary_stats(TICKER)
-        if not latest_balance.empty:
-            current_price = latest_balance['current_price'].iloc[0]
-    except Exception:
-        current_price = None
-
-    with metrics_container.container():
-        # 코인명/현재가 출력 (메트릭 위로 이동)
-        coin_name = get_coin_name(TICKER)
-        if current_price is not None:
-            st.markdown(f"### {TICKER} ({coin_name}) | 현재가: **{current_price:,.2f}원**")
-        else:
-            st.markdown(f"### {TICKER} ({coin_name}) | 현재가: -")
-        # 요약 통계 (7일 고정)
-        trades_stats, latest_balance = get_summary_stats(TICKER)
+        trades_df = pd.read_sql_query(f"SELECT * FROM trades WHERE ticker = '{ticker}' ORDER BY timestamp DESC", conn)
+        balance_df = pd.read_sql_query(f"SELECT * FROM balance_history WHERE ticker = '{ticker}' ORDER BY timestamp ASC", conn)
+        grid_df = pd.read_sql_query(f"SELECT * FROM grid WHERE ticker = '{ticker}' ORDER BY grid_level ASC", conn)
+        config_df = pd.read_sql_query(f"SELECT * FROM coin_config WHERE ticker = '{ticker}'", conn)
         
-        # 상단 메트릭
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            total_trades = trades_stats['total_trades'].iloc[0] if not trades_stats.empty else 0
-            buy_count = trades_stats['buy_count'].iloc[0] if not trades_stats.empty else 0
-            sell_count = trades_stats['sell_count'].iloc[0] if not trades_stats.empty else 0
-            
-            st.metric(
-                "총 거래 횟수",
-                f"{total_trades:,}회",
-                f"매수: {buy_count:,}회 / 매도: {sell_count:,}회"
-            )
-        
-        with col2:
-            total_profit = trades_stats['total_profit'].iloc[0] if not trades_stats.empty else 0
-            total_fees = trades_stats['total_fees'].iloc[0] if not trades_stats.empty else 0
-            profit_color = "normal" if total_profit >= 0 else "inverse"
-            
-            # 그리드 설정액 대비 수익률 계산
-            profit_percentage_on_grid_text = "" 
-            if not grid_df.empty and 'order_krw_amount' in grid_df.columns:
-                # order_krw_amount는 그리드 전체에 동일하다고 가정하고 첫 번째 값을 사용
-                order_krw_amount_value = grid_df['order_krw_amount'].iloc[0] 
-                num_grid_levels = len(grid_df)
+        return trades_df, balance_df, grid_df, config_df.iloc[0] if not config_df.empty else None
+    finally:
+        put_dashboard_db_connection(conn)
 
-                # order_krw_amount_value가 유효한 숫자인지, 0보다 큰지, 그리드 레벨이 있는지 확인
-                if pd.notna(order_krw_amount_value) and order_krw_amount_value > 0 and num_grid_levels > 0:
-                    total_potential_investment = num_grid_levels * order_krw_amount_value
-                    # total_potential_investment가 0이 아닐 때만 계산 (0으로 나누기 방지)
-                    profit_vs_potential_investment_pct = (total_profit / total_potential_investment) * 100 if total_potential_investment != 0 else 0
-                    profit_percentage_on_grid_text = f"그리드 설정액 대비: {profit_vs_potential_investment_pct:+.2f}%"
-                else:
-                    profit_percentage_on_grid_text = "그리드 정보 계산 불가" # 계산에 필요한 정보 부족
-            else:
-                profit_percentage_on_grid_text = "그리드 정보 없음" # grid_df가 비어있거나 필요한 컬럼 부재
-
-            current_delta_text = f"수수료: {total_fees:,.0f}원{format_korean_won(total_fees, with_space=False)}"
-            if profit_percentage_on_grid_text: # 계산된 수익률 정보가 있으면 추가
-                 current_delta_text += f" | {profit_percentage_on_grid_text}"
-            
-            st.metric(
-                "총 수익",
-                f"{total_profit:,.0f}원",
-                delta=current_delta_text,
-                delta_color=profit_color
-            )
+@st.cache_data(ttl=REFRESH_INTERVAL)
+def get_invested_capital(ticker: str):
+    """현재 투자된 자본(매수된 그리드의 총합)을 계산합니다."""
+    conn = get_dashboard_db_connection()
+    try:
+        sql = "SELECT COALESCE(SUM(order_krw_amount), 0) AS total FROM grid WHERE ticker = ? AND is_bought = ?"
+        is_bought_param = 1 if APP_MODE == "TEST" else True
         
-        with col3:
-            if not latest_balance.empty:
-                # 이전 자산과 비교하여 변화율 계산
-                balance_df = load_balance_history(7)
-                if not balance_df.empty and len(balance_df) > 1:
-                    prev_assets = balance_df['total_assets'].iloc[-2]
-                    current_assets = latest_balance['total_assets'].iloc[0]
-                    assets_change = current_assets - prev_assets
-                    assets_change_pct = (assets_change / prev_assets) * 100 if prev_assets > 0 else 0
-                    delta_text = f"{assets_change:+,.0f}원 ({assets_change_pct:+.2f}%)"
-                else:
-                    delta_text = "변화 없음"
+        cursor = conn.cursor()
+        cursor.execute(sql, (ticker, is_bought_param))
+        result = cursor.fetchone()
+        return result[0] if result else 0
+    finally:
+        put_dashboard_db_connection(conn)
 
-                st.metric(
-                    "현재 총 자산",
-                    f"{latest_balance['total_assets'].iloc[0]:,.0f}원",
-                    delta_text
-                )
-        
-        with col4:
-            if not latest_balance.empty:
-                coin_value = latest_balance['coin_balance'].iloc[0] * latest_balance['current_price'].iloc[0]
-                # 이전 코인 가치와 비교
-                balance_df = load_balance_history(7)  # balance_df 정의 추가
-                if not balance_df.empty and len(balance_df) > 1:
-                    prev_coin_value = balance_df['coin_balance'].iloc[-2] * balance_df['current_price'].iloc[-2]
-                    coin_value_change = coin_value - prev_coin_value
-                    coin_value_change_pct = (coin_value_change / prev_coin_value) * 100 if prev_coin_value > 0 else 0
-                    delta_text = f"{coin_value_change:+,.0f}원{format_korean_won(coin_value_change)} ({coin_value_change_pct:+.2f}%)"
-                else:
-                    delta_text = "변화 없음"
-
-                st.metric(
-                    "보유 코인 가치",
-                f"{coin_value:,.0f}원{format_korean_won(coin_value)}",
-                    delta_text
-                )
+# --- UI 핸들러 ---
+def handle_config_update(ticker, key, value):
+    """DB의 코인 설정을 업데이트합니다."""
+    if key not in ['is_active', 'budget_krw']:
+        st.error("잘못된 설정 키입니다.")
+        return
     
-    with grid_container.container():
-        # 그리드 현황
-        kst = timezone(timedelta(hours=9))
-        current_time_kst = datetime.now(kst)
-        current_time_small = current_time_kst.strftime('%H:%M:%S')
-        st.markdown(
-            f"""
-            <div style="display: flex; align-items: center; margin-bottom: 20px;">
-                <h3 style="margin: 0; margin-right: 15px;">그리드 현황</h3>
-                <span style="
-                    font-size: 12px; 
-                    color: white;
-                    padding: 2px 8px;
-                    border-radius: 10px;
-                    animation: colorTransition {REFRESH_INTERVAL}s ease-in-out infinite;
-                ">
-                    🔄 {current_time_small} 업데이트됨
-                </span>
-            </div>
-            <style>
-            @keyframes colorTransition {{
-                0% {{ 
-                    background: linear-gradient(45deg, #606060, #505050);
-                }}
-                10% {{
-                    background: linear-gradient(45deg, #666666, #565656);
-                }}
-                20% {{
-                    background: linear-gradient(45deg, #6c6c6c, #5c5c5c);
-                }}
-                30% {{
-                    background: linear-gradient(45deg, #727272, #626262);
-                }}
-                40% {{
-                    background: linear-gradient(45deg, #787878, #686868);
-                }}
-                50% {{
-                    background: linear-gradient(45deg, #7e7e7e, #6e6e6e);
-                }}
-                60% {{
-                    background: linear-gradient(45deg, #848484, #747474);
-                }}
-                70% {{
-                    background: linear-gradient(45deg, #8a8a8a, #7a7a7a);
-                }}
-                80% {{
-                    background: linear-gradient(45deg, #909090, #808080);
-                }}
-                90% {{
-                    background: linear-gradient(45deg, #969696, #868686);
-                }}
-                100% {{ 
-                    background: linear-gradient(45deg, #9c9c9c, #8c8c8c);
-                }}
-            }}
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-        # grid_df는 이미 위에서 로드했으므로 재사용
+    if APP_MODE == "TEST":
+        conn = get_dashboard_db_connection()
+        try:
+            val = 1 if value is True else (0 if value is False else value)
+            sql = f"UPDATE coin_config SET {key} = ?, updated_at = CURRENT_TIMESTAMP WHERE ticker = ?"
+            conn.execute(sql, (val, ticker))
+            conn.commit()
+        finally:
+            put_dashboard_db_connection(conn)
+    else:
+        sql = f"UPDATE coin_config SET {key} = %s, updated_at = CURRENT_TIMESTAMP WHERE ticker = %s"
+        db.execute(sql, (value, ticker))
+
+    st.cache_data.clear()
+    st.success(f"{ticker}의 {key} 설정이 업데이트되었습니다. 잠시 후 반영됩니다.")
+    # 확인 상태 초기화
+    st.session_state.confirming_action = None
+    st.session_state.action_params = {}
+    time.sleep(1) # UI가 다시 그려질 시간을 줌
+    st.rerun()
+
+
+def render_confirmation_dialog():
+    """확인 다이얼로그를 렌더링합니다."""
+    action = st.session_state.confirming_action
+    params = st.session_state.action_params
+
+    if action == 'toggle_active':
+        ticker = params['ticker']
+        new_value = params['value']
+        status_text = "활성화" if new_value else "비활성화"
+        st.warning(f"정말로 {ticker}의 거래를 **{status_text}** 하시겠습니까?")
         
-        if not grid_df.empty:
-            # 컬럼명 한글로 변경
-            grid_df_display = grid_df.copy()
-            grid_df_display = grid_df_display.rename(columns={
-                'grid_level': '구간',
-                'buy_price_target': '매수목표가',
-                'sell_price_target': '매도목표가',
-                'order_krw_amount': '주문금액',
-                'is_bought': '매수상태',
-                'actual_bought_volume': '매수수량',
-                'actual_buy_fill_price': '매수가격',
-                'timestamp': '최종업데이트'
-            })
-            
-            # 데이터 포맷팅
-            grid_df_display['매수목표가'] = grid_df_display['매수목표가'].apply(lambda x: f"{x:,.2f}원{format_korean_won(x)}")
-            grid_df_display['매도목표가'] = grid_df_display['매도목표가'].apply(lambda x: f"{x:,.2f}원{format_korean_won(x)}")
-            grid_df_display['주문금액'] = grid_df_display['주문금액'].apply(lambda x: f"{x:,.0f}원{format_korean_won(x)}")
-            grid_df_display['매수수량'] = grid_df_display['매수수량'].apply(lambda x: f"{x:.8f}" if x > 0 else "-")
-            grid_df_display['매수가격'] = grid_df_display['매수가격'].apply(lambda x: f"{x:,.2f}원" if x > 0 else "-")
-            grid_df_display['매수상태'] = grid_df_display['매수상태'].apply(lambda x: "매수완료" if x else "대기중")
-            grid_df_display['최종업데이트'] = pd.to_datetime(grid_df_display['최종업데이트']).dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 구간 컬럼에 화살표 추가
-            def add_arrow_to_current_grid(row):
-                try:
-                    price = current_price
-                    buy_target = float(str(row['매수목표가']).replace('원','').replace(',',''))
-                    sell_target = float(str(row['매도목표가']).replace('원','').replace(',',''))
-                    
-                    # 현재가가 해당 그리드의 가격 범위에 있는지 확인
-                    # 그리드 범위: 매수목표가 < 현재가 <= 매도목표가
-                    if buy_target < price <= sell_target:
-                        return f"→ {row['구간']}"
-                except Exception:
-                    pass
-                return str(row['구간'])  # 항상 문자열로 반환
+        col1, col2 = st.columns(2)
+        if col1.button("예, 변경합니다.", key="confirm_yes"):
+            handle_config_update(ticker, 'is_active', new_value)
+        if col2.button("아니오, 취소합니다.", key="confirm_no"):
+            st.session_state.confirming_action = None
+            st.session_state.action_params = {}
+            st.rerun()
 
-            grid_df_display['구간'] = grid_df_display.apply(add_arrow_to_current_grid, axis=1).astype(str)
+    elif action == 'update_budget':
+        ticker = params['ticker']
+        new_value = params['value']
+        st.warning(f"{ticker}의 할당 예산을 **{new_value:,.0f}원**으로 변경하시겠습니까?")
 
-            # 표시할 컬럼 선택
-            display_columns = ['구간', '매수목표가', '매도목표가', '주문금액', '매수상태', '매수수량', '매수가격', '최종업데이트']
-            
-            def highlight_current_grid(row):
-                try:
-                    price = current_price
-                    buy_target = float(str(row['매수목표가']).replace('원','').replace(',',''))
-                    sell_target = float(str(row['매도목표가']).replace('원','').replace(',',''))
-                    
-                    # 현재가가 해당 그리드의 가격 범위에 있는지 확인
-                    # 그리드 범위: 매수목표가 < 현재가 <= 매도목표가
-                    if buy_target < price <= sell_target:
-                        return ['color: red'] * len(row)
-                except Exception:
-                    pass
-                return [''] * len(row)
+        col1, col2 = st.columns(2)
+        if col1.button("예, 변경합니다.", key="confirm_yes"):
+            handle_config_update(ticker, 'budget_krw', new_value)
+        if col2.button("아니오, 취소합니다.", key="confirm_no"):
+            st.session_state.confirming_action = None
+            st.session_state.action_params = {}
+            st.rerun()
 
-            styled_grid = grid_df_display[display_columns].style.apply(highlight_current_grid, axis=1)
-            
-            # 그리드 현황은 모든 행을 표시하도록 height 파라미터 제거
-            st.dataframe(
-                styled_grid,
-                use_container_width=True,
-                hide_index=True
+# --- 메인 대시보드 ---
+def main():
+    with st.sidebar:
+        st.title("📈 Bit-Moon")
+        
+        available_tickers = [coin['TICKER'] for coin in TradingConfig.COIN_LIST]
+        selected_ticker = st.selectbox("코인 선택", options=available_tickers)
+        
+        st.markdown("---")
+
+        trades_df, balance_df, grid_df, coin_config = load_data(selected_ticker)
+
+        st.subheader(f"{selected_ticker} 제어판")
+        if coin_config is not None:
+            # 확인 다이얼로그가 활성화된 경우, 다른 컨트롤 비활성화
+            is_confirming = st.session_state.confirming_action is not None
+
+            # 거래 활성화 토글
+            is_active_now = bool(coin_config['is_active'])
+            new_is_active = st.toggle(
+                "거래 활성화", 
+                value=is_active_now, 
+                key=f"active_{selected_ticker}",
+                disabled=is_confirming
             )
+            if new_is_active != is_active_now and not is_confirming:
+                st.session_state.confirming_action = 'toggle_active'
+                st.session_state.action_params = {'ticker': selected_ticker, 'value': new_is_active}
+                st.rerun()
+
+            # 예산 설정
+            budget_now = float(coin_config['budget_krw'])
+            new_budget = st.number_input(
+                "할당 예산 (원)", 
+                value=budget_now, 
+                min_value=0.0, 
+                step=50000.0, 
+                key=f"budget_{selected_ticker}",
+                format="%.0f",
+                disabled=is_confirming
+            )
+            if new_budget != budget_now and not is_confirming:
+                if new_budget <= 0:
+                    st.error("할당 예산은 0보다 커야 합니다.")
+                else:
+                    st.session_state.confirming_action = 'update_budget'
+                    st.session_state.action_params = {'ticker': selected_ticker, 'value': new_budget}
+                    st.rerun()
+            
+            # 확인 다이얼로그 렌더링
+            if is_confirming:
+                render_confirmation_dialog()
+
         else:
-            st.info("현재 활성화된 그리드가 없습니다.")
+            st.warning("설정 정보를 불러올 수 없습니다.")
+
+        st.markdown("---")
+        auto_refresh = st.toggle("자동 새로고침 (10초)", value=True)
+        if 'last_update' not in st.session_state:
+            st.session_state.last_update = "N/A"
+        st.info(f"마지막 업데이트: {st.session_state.last_update}")
+
+    # --- 메인 콘텐츠 ---
+    st.header(f"{selected_ticker} 대시보드")
+
+    if balance_df.empty:
+        st.warning("선택한 코인에 대한 데이터가 없습니다. 거래 봇이 실행 중인지 확인하세요.")
+        st.stop()
+
+    latest_balance = balance_df.iloc[-1]
+    total_profit = trades_df['profit'].sum()
+    invested_capital = get_invested_capital(selected_ticker)
     
-    with trades_container.container():
-        # 거래 내역
-        kst = timezone(timedelta(hours=9))
-        current_time_kst = datetime.now(kst)
-        current_time_small = current_time_kst.strftime('%H:%M:%S')
-        st.markdown(
-            f"""
-            <div style="display: flex; align-items: center; margin-bottom: 20px;">
-                <h3 style="margin: 0; margin-right: 15px;">거래 내역</h3>
-                <span style="
-                    font-size: 12px; 
-                    color: white;
-                    padding: 2px 8px;
-                    border-radius: 10px;
-                    animation: colorTransition {REFRESH_INTERVAL}s ease-in-out infinite;
-                ">
-                    📈 {current_time_small} 업데이트됨
-                </span>
-            </div>
-            <style>
-            @keyframes colorTransition {{
-                0% {{ 
-                    background: linear-gradient(45deg, #606060, #505050);
-                }}
-                10% {{
-                    background: linear-gradient(45deg, #666666, #565656);
-                }}
-                20% {{
-                    background: linear-gradient(45deg, #6c6c6c, #5c5c5c);
-                }}
-                30% {{
-                    background: linear-gradient(45deg, #727272, #626262);
-                }}
-                40% {{
-                    background: linear-gradient(45deg, #787878, #686868);
-                }}
-                50% {{
-                    background: linear-gradient(45deg, #7e7e7e, #6e6e6e);
-                }}
-                60% {{
-                    background: linear-gradient(45deg, #848484, #747474);
-                }}
-                70% {{
-                    background: linear-gradient(45deg, #8a8a8a, #7a7a7a);
-                }}
-                80% {{
-                    background: linear-gradient(45deg, #909090, #808080);
-                }}
-                90% {{
-                    background: linear-gradient(45deg, #969696, #868686);
-                }}
-                100% {{ 
-                    background: linear-gradient(45deg, #9c9c9c, #8c8c8c);
-                }}
-            }}
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-        trades_df = load_trades(7, TICKER)  # TICKER 전달
-        
-        if not trades_df.empty:
-            # 거래 타입별 색상 설정 (buy_sell 컬럼 사용)
-            trades_df['color'] = trades_df['buy_sell'].map({'buy': 'red', 'sell': 'blue'})
-            
-            # 거래 내역 테이블
-            trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
-            trades_df['timestamp'] = trades_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-            
-            # 컬럼명 한글로 변경 (buy_sell -> 거래유형)
-            trades_df = trades_df.rename(columns={
-                'timestamp': '시간',
-                'buy_sell': '거래유형',
-                'grid_level': '그리드레벨',
-                'price': '가격',
-                'amount': '거래금액',
-                'volume': '거래수량',
-                'fee': '수수료',
-                'profit': '수익',
-                'profit_percentage': '수익률'
-            })
-            
-            # 표시할 컬럼 선택
-            display_columns = ['시간', '거래유형', '그리드레벨', '가격', '거래금액', '거래수량', '수수료', '수익', '수익률']
-            
-            # 데이터 포맷팅
-            for col in ['가격', '거래금액', '수수료', '수익']:
-                trades_df[col] = trades_df[col].apply(lambda x: f"{x:,.0f}원")
-            
-            trades_df['수익률'] = trades_df['수익률'].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "-")
-            trades_df['거래수량'] = trades_df['거래수량'].apply(lambda x: f"{x:.8f}")
-            
-            st.dataframe(
-                trades_df[display_columns],
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("조회 기간 내 거래 내역이 없습니다.")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("현재 총 자산", f"{latest_balance['total_assets']:,.0f}원")
+    col2.metric("총 실현 수익", f"{total_profit:,.0f}원")
+    col3.metric("현재 투입된 자본", f"{invested_capital:,.0f}원")
+    
+    if coin_config is not None and coin_config['budget_krw'] > 0:
+        budget = coin_config['budget_krw']
+        usage_percent = min(int((invested_capital / budget) * 100), 100)
+        col4.metric("예산 사용률", f"{usage_percent}%")
+        st.progress(usage_percent / 100, text=f"{invested_capital:,.0f} / {budget:,.0f} 원")
+    else:
+        col4.metric("예산 사용률", "N/A")
+
+    st.markdown("---")
+    
+    col_grid, col_trades = st.columns(2)
+    with col_grid:
+        st.subheader("그리드 현황")
+        st.dataframe(grid_df, use_container_width=True, hide_index=True)
+
+    with col_trades:
+        st.subheader("최근 거래 내역")
+        st.dataframe(trades_df.head(15), use_container_width=True, hide_index=True)
+
+    if auto_refresh and not st.session_state.confirming_action:
+        time.sleep(REFRESH_INTERVAL)
+        st.session_state.last_update = datetime.now(timezone(timedelta(hours=9))).strftime('%H:%M:%S')
+        st.rerun()
 
 if __name__ == "__main__":
+    if APP_MODE == "PRODUCTION":
+        db.init_db(DBConfig)
     main()

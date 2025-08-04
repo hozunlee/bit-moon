@@ -1,6 +1,6 @@
 # 기본 라이브러리
 # numpy==1.24.3
-pandas==2.1.4
+pandas
 python-dotenv==1.0.0
 requests==2.31.0
 
@@ -9,6 +9,7 @@ pyupbit==0.2.31
 ccxt==4.1.64
 
 # 데이터베이스
+psycopg2-binary
 
 # 로깅 및 스케줄링
 schedule==1.2.0

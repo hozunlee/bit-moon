@@ -29,3 +29,4 @@ data/
 # 기타
 *.bak
 *.swp
+.venv/

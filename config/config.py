@@ -3,13 +3,12 @@
 환경변수와 거래 관련 설정값을 관리합니다.
 """
 import os
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pathlib import Path
-# from dotenv import load_dotenv
 
-# .env 파일에서 환경변수 로드
-# load_dotenv()
+# 애플리케이션 모드 설정
+APP_MODE = os.environ.get("APP_MODE", "PRODUCTION")
 
 # API 키 설정
 class APIConfig:
@@ -18,73 +17,70 @@ class APIConfig:
     SECRET_KEY: str = os.environ.get("UPBIT_SECRET_KEY", "")
     DISCORD_WEBHOOK_URL: Optional[str] = os.environ.get("DISCORD_WEBHOOK_URL")
 
-# 기존 리플 설정 
-# # 거래 설정
-# class TradingConfig:
-#     """거래 관련 설정"""
-#     # 기본 코인 설정
-#     TICKER: str = "KRW-XRP"  # 거래할 코인 (티커 형식)
-    
-#     # 그리드 거래 설정
-#     BASE_PRICE: Optional[float] = 3200.0  # 기준 가격 (None이면 현재가로 자동 설정)
-#     PRICE_CHANGE: float = 20.0  # 그리드 간 가격 차이 (원)
-#     MAX_GRID_COUNT: int = 50  # 최대 그리드 수 (1~100)
-#     ORDER_AMOUNT: float = 30000.0  # 주문당 금액 (원, 최소 5,000원)
-    
-#     # 실행 설정
-#     CHECK_INTERVAL: int = 10  # 가격 체크 간격 (초)
-#     FEE_RATE: float = 0.0005  # 거래 수수료 (0.05%)
-    
+# 데이터베이스 설정
+class DBConfig:
+    """데이터베이스 연결 설정"""
+    DB_USER: str = os.environ.get("DB_USER", "postgres")
+    DB_PASSWORD: str = os.environ.get("DB_PASSWORD", "")
+    DB_HOST: str = os.environ.get("DB_HOST", "localhost")
+    DB_PORT: str = os.environ.get("DB_PORT", "5432")
+    DB_NAME: str = os.environ.get("DB_NAME", "trading_db")
 
+    @classmethod
+    def get_db_url(cls) -> str:
+        """PostgreSQL 연결 URL 생성"""
+        return f"postgresql://{cls.DB_USER}:{cls.DB_PASSWORD}@{cls.DB_HOST}:{cls.DB_PORT}/{cls.DB_NAME}"
 
 # 거래 설정
 class TradingConfig:
     """거래 관련 설정"""
-    # 기본 코인 설정
-    TICKER: str = "KRW-BTC"   # 거래할 코인 (티커 형식)
+    # 거래할 코인 목록
+    COIN_LIST: List[Dict[str, Any]] = [
+        {
+            "TICKER": "KRW-BTC",
+            "BASE_PRICE": 166800000,
+            "PRICE_CHANGE": 513350.0,
+            "MAX_GRID_COUNT": 20,
+            "ORDER_AMOUNT": 250000,
+        },
+        {
+            "TICKER": "KRW-ETH",
+            "BASE_PRICE": 4500000,
+            "PRICE_CHANGE": 22500.0, # 0.5%
+            "MAX_GRID_COUNT": 20,
+            "ORDER_AMOUNT": 50000,
+        }
+    ]
     
-    # 그리드 거래 설정
-    BASE_PRICE: Optional[float] = 166800000 # 기준 가격 (None이면 현재가로 자동 설정) 1구간 설정
-    PRICE_CHANGE: float = 513350.0  # 2% 간격 (최적화)
-    MAX_GRID_COUNT: int = 20  # 효율성을 위한 그리드 수 축소
-    ORDER_AMOUNT: float = 250000  # 수당 금액 증액 (25만원)
-    
-    # 실행 설정
+    # 공통 실행 설정
     CHECK_INTERVAL: int = 10  # 가격 체크 간격 (초)
     FEE_RATE: float = 0.0005  # 거래 수수료 (0.05%)
-        
-    # 기능 설정
     DISCORD_LOGGING: bool = False  # 디스코드 로깅 사용 여부
     PLAY_SOUND: bool = True  # 소리 알림 사용 여부
 
-# 데이터베이스 설정
-class DBConfig:
-    """데이터베이스 관련 설정"""
-    # 디렉토리 및 파일 설정
-    DB_DIR: Path = Path(__file__).parent.parent / 'data'
-    DB_PREFIX: str = "trading_history"
-    DB_EXTENSION: str = "db"
+# 데이터베이스 및 로그 경로 설정
+class PathConfig:
+    """데이터 및 로그 경로 설정"""
+    def __init__(self, ticker: str):
+        # 티커에서 'KRW-'를 제거하고 소문자로 만들어 폴더 이름으로 사용 (예: btc, eth)
+        self.ticker_id = ticker.replace('KRW-', '').lower()
+        
+        # 기본 로그 디렉토리 경로 설정
+        base_dir = Path(__file__).parent.parent
+        self.base_logs_dir = base_dir / 'logs'
+        
+        # 코인별 로그 디렉토리 경로 정의
+        self.coin_logs_dir: Path = self.base_logs_dir / self.ticker_id
+        
+        # 디렉토리가 존재하지 않으면 생성
+        self.coin_logs_dir.mkdir(parents=True, exist_ok=True)
 
-    @classmethod
-    def get_db_dir(cls) -> Path:
-        """
-        Returns the data directory as a Path object, creating it if necessary.
-        """
-        cls.DB_DIR.mkdir(parents=True, exist_ok=True)
-        return cls.DB_DIR
+    def get_log_filename(self) -> Path:
+        """코인별 로그 파일 경로를 생성"""
+        filename = f"{self.ticker_id}_grid_trade.log"
+        return self.coin_logs_dir / filename
 
-    @classmethod
-    def get_db_filename(cls) -> Path:
-        """
-        Returns a Path object for a new DB file, based on the current date and time.
-        """
-        db_dir = cls.get_db_dir()
-        timestamp = datetime.now().strftime('%Y%m%d%H%M')
-        filename = f"{cls.DB_PREFIX}_{timestamp}.{cls.DB_EXTENSION}"
-        return db_dir / filename
-
-
-# 테스트 설정
+# 테스트 설정 (변경 없음)
 class TestConfig:
     """테스트 관련 설정"""
     # 테스트 데이터 디렉토리 설정
