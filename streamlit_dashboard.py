@@ -17,6 +17,17 @@ from config.config import DBConfig, TradingConfig
 REFRESH_INTERVAL = 10  # 자동 새로고침 간격 (초)
 KST = timezone(timedelta(hours=9))
 
+# --- 유틸리티 함수 ---
+def get_coin_name(ticker):
+    """TICKER에 해당하는 코인 한글 이름을 반환합니다."""
+    coin_map = {
+        "KRW-BTC": "비트코인",
+        "KRW-ETH": "이더리움",
+        "KRW-XRP": "리플",
+        # 필요시 다른 코인 추가
+    }
+    return coin_map.get(ticker, ticker)
+
 # --- 데이터베이스 관련 함수 ---
 
 def get_db_connection():
@@ -48,9 +59,10 @@ def get_current_ticker():
             if not result.empty:
                 return result['ticker'].iloc[0]
             
-            return TradingConfig.TICKER
+            # TradingConfig에 TICKER가 정의되어 있지 않을 수 있으므로 기본값 설정
+            return "KRW-BTC"
         except Exception:
-            return TradingConfig.TICKER
+            return "KRW-BTC"
 
 @st.cache_data(ttl=REFRESH_INTERVAL)
 def load_data(ticker):
@@ -99,9 +111,11 @@ def get_total_investment(grid_df):
 
 def format_korean_won(num):
     """숫자를 한글 단위(천, 만, 억)로 변환합니다."""
-    if not isinstance(num, (int, float)) or pd.isna(num) or num_abs < 1000:
+    if not isinstance(num, (int, float)) or pd.isna(num):
         return ""
     num_abs = abs(int(num))
+    if num_abs < 1000:
+        return ""
     units = {100000000: "억", 10000: "만", 1000: "천"}
     for unit_val, unit_name in units.items():
         if num_abs >= unit_val:
@@ -271,7 +285,7 @@ def main():
             
             start_time = get_start_time()
             current_price = balance_df.iloc[-1]['current_price'] if not balance_df.empty else None
-            coin_name = TradingConfig.COIN_MAP.get(TICKER, TICKER)
+            coin_name = get_coin_name(TICKER)
 
             # 헤더
             price_str = f"{current_price:,.2f} 원" if current_price else "정보 없음"
