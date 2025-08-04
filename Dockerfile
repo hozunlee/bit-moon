@@ -41,6 +41,7 @@ ENV PATH=/root/.local/bin:$PATH
 # 애플리케이션 코드 복사
 COPY product_app.py .
 COPY streamlit_dashboard.py .
+COPY db_handler.py .
 # COPY test.py .
 # COPY dash.py .
 COPY start.sh .
