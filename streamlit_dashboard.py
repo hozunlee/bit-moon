@@ -1,309 +1,204 @@
+"""
+Streamlit 대시보드 (다중 코인 통합 관리 버전)
+"""
 import streamlit as st
 import pandas as pd
 import sqlite3
-import plotly.graph_objects as go
-from datetime import datetime, timedelta, timezone
-import numpy as np
 import time
-import streamlit.components.v1 as components
-import glob
-import os
+import argparse
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional
 
-# 설정 가져오기
-from config.config import DBConfig, TradingConfig
+# 설정 및 유틸리티 임포트
+from config.config import TradingConfig, PathConfig
 
 # --- 전역 설정 ---
 REFRESH_INTERVAL = 10  # 자동 새로고침 간격 (초)
 KST = timezone(timedelta(hours=9))
 
 # --- 유틸리티 함수 ---
-def get_coin_name(ticker):
+def get_coin_name(ticker: str) -> str:
     """TICKER에 해당하는 코인 한글 이름을 반환합니다."""
-    coin_map = {
-        "KRW-BTC": "비트코인",
-        "KRW-ETH": "이더리움",
-        "KRW-XRP": "리플",
-        # 필요시 다른 코인 추가
-    }
-    return coin_map.get(ticker, ticker)
+    name_map = {"BTC": "비트코인", "ETH": "이더리움", "XRP": "리플"}
+    coin_symbol = ticker.replace("KRW-", "")
+    return name_map.get(coin_symbol, coin_symbol)
 
-# --- 데이터베이스 관련 함수 ---
-
-def get_db_connection():
-    """가장 최근 DB 파일을 찾아 연결합니다."""
-    data_dir = DBConfig.get_db_dir()
-    if not data_dir.exists():
-        st.error(f"데이터 디렉토리({data_dir})를 찾을 수 없습니다.")
-        st.stop()
-    
-    db_files = sorted(data_dir.glob('trading_history_*.db'), reverse=True)
-    if not db_files:
-        st.error("trading_history_*.db 파일을 찾을 수 없습니다. 거래 프로그램을 먼저 실행해주세요.")
-        st.stop()
-    
-    return sqlite3.connect(db_files[0], check_same_thread=False)
-
-@st.cache_data(ttl=REFRESH_INTERVAL)
-def get_current_ticker():
-    """데이터베이스에서 현재 사용 중인 TICKER를 가져옵니다."""
-    with get_db_connection() as conn:
-        try:
-            query = "SELECT DISTINCT ticker FROM grid ORDER BY timestamp DESC LIMIT 1"
-            result = pd.read_sql_query(query, conn)
-            if not result.empty:
-                return result['ticker'].iloc[0]
-            
-            query = "SELECT DISTINCT ticker FROM trades ORDER BY timestamp DESC LIMIT 1"
-            result = pd.read_sql_query(query, conn)
-            if not result.empty:
-                return result['ticker'].iloc[0]
-            
-            # TradingConfig에 TICKER가 정의되어 있지 않을 수 있으므로 기본값 설정
-            return "KRW-BTC"
-        except Exception:
-            return "KRW-BTC"
-
-@st.cache_data(ttl=REFRESH_INTERVAL)
-def load_data(ticker):
-    """모든 필요한 데이터를 한 번에 로드합니다."""
-    with get_db_connection() as conn:
-        trades_query = "SELECT * FROM trades WHERE ticker = ? ORDER BY timestamp DESC"
-        trades_df = pd.read_sql_query(trades_query, conn, params=(ticker,))
-
-        balance_query = "SELECT * FROM balance_history ORDER BY timestamp ASC"
-        balance_df = pd.read_sql_query(balance_query, conn)
-
-        grid_query = """
-            WITH latest_grid AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY grid_level ORDER BY timestamp DESC) as rn
-                FROM grid WHERE ticker = ?
-            )
-            SELECT * FROM latest_grid WHERE rn = 1 ORDER BY grid_level ASC
-        """
-        grid_df = pd.read_sql_query(grid_query, conn, params=(ticker,))
-        
+# --- 데이터 로드 함수 ---
+@st.cache_data(ttl=60)
+def load_data(ticker: str):
+    """지정된 티커의 DB에서 모든 데이터를 로드합니다."""
+    db_path = PathConfig(ticker).get_db_filename()
+    if not db_path.exists():
+        return None, None, None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            trades_df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC", conn)
+            balance_df = pd.read_sql_query("SELECT * FROM balance_history ORDER BY timestamp ASC", conn)
+            grid_df = pd.read_sql_query("SELECT * FROM grid ORDER BY timestamp DESC", conn) # 최신순으로 정렬
         return trades_df, balance_df, grid_df
+    except sqlite3.OperationalError:
+        # DB가 잠겨있을 경우 잠시 후 재시도
+        time.sleep(0.5)
+        return load_data(ticker)
 
-@st.cache_data(ttl=3600) # 시작 시간은 자주 바뀌지 않으므로 캐시 기간을 길게 설정
-def get_start_time():
-    """봇의 시작 시간을 가져옵니다 (가장 첫 번째 잔고 기록 시간)."""
-    with get_db_connection() as conn:
-        try:
-            query = "SELECT MIN(timestamp) as start_time FROM balance_history"
-            result = pd.read_sql_query(query, conn)
-            if not result.empty and result['start_time'].iloc[0]:
-                return pd.to_datetime(result['start_time'].iloc[0])
-        except Exception:
-            return None
-    return None
 
-def get_total_investment(grid_df):
-    """현재 그리드 설정 기준 총 투자 원금을 계산합니다."""
-    if not grid_df.empty and 'order_krw_amount' in grid_df.columns:
-        order_amount = grid_df['order_krw_amount'].iloc[0]
-        num_grids = len(grid_df)
-        if pd.notna(order_amount) and order_amount > 0 and num_grids > 0:
-            return num_grids * order_amount
-    return 0
+@st.cache_data(ttl=3600)
+def get_first_start_time(ticker: str) -> Optional[datetime]:
+    """봇의 최초 시작 시간을 DB에서 가져옵니다."""
+    _, balance_df, _ = load_data(ticker)
+    if balance_df is None or balance_df.empty:
+        return None
+    try:
+        first_time_str = balance_df['timestamp'].iloc[0]
+        return pd.to_datetime(first_time_str).tz_localize(KST)
+    except Exception:
+        return None
 
-# --- UI 컴포넌트 및 포맷팅 함수 ---
+@st.cache_data(ttl=60)
+def get_session_start_time(ticker: str) -> Optional[datetime]:
+    """현재 세션의 시작 시간을 파일에서 읽어옵니다."""
+    session_file = PathConfig(ticker).get_session_filename()
+    if not session_file.exists(): return None
+    try:
+        with open(session_file, 'r', encoding='utf-8') as f:
+            iso_timestamp = f.read().strip()
+            # fromisoformat은 시간대 정보가 포함된 문자열을 올바르게 파싱합니다.
+            return datetime.fromisoformat(iso_timestamp)
+    except Exception:
+        return None
 
-def format_korean_won(num):
-    """숫자를 한글 단위(천, 만, 억)로 변환합니다."""
-    if not isinstance(num, (int, float)) or pd.isna(num):
-        return ""
-    num_abs = abs(int(num))
-    if num_abs < 1000:
-        return ""
-    units = {100000000: "억", 10000: "만", 1000: "천"}
-    for unit_val, unit_name in units.items():
-        if num_abs >= unit_val:
-            val = num_abs / unit_val
-            formatted_val = f"{val:.1f}".rstrip('0').rstrip('.')
-            return f" ({formatted_val}{unit_name})"
-    return ""
-
-def display_bot_status(start_time):
-    """봇 운영 상태 (시작 시간, 운영 시간)를 표시합니다."""
-    st.markdown("---")
-    col1, col2 = st.columns(2)
-    with col1:
-        if start_time:
-            st.markdown(f"**⏳ 봇 시작 시간:** {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            st.markdown("**⏳ 봇 시작 시간:** 정보 없음")
-    with col2:
-        if start_time:
-            uptime = datetime.now(KST) - start_time.replace(tzinfo=KST)
-            days, remainder = divmod(uptime.total_seconds(), 86400)
-            hours, remainder = divmod(remainder, 3600)
-            minutes, _ = divmod(remainder, 60)
-            st.markdown(f"**⏱️ 총 운영 시간:** {int(days)}일 {int(hours)}시간 {int(minutes)}분")
-        else:
-            st.markdown("**⏱️ 총 운영 시간:** 정보 없음")
-    st.markdown("---")
-
-def display_kpi_metrics(trades_df, balance_df, grid_df):
-    """핵심 성과 지표(KPI)를 5개 컬럼으로 표시합니다."""
+# --- UI 컴포넌트 ---
+def display_kpi_metrics(trades_df: pd.DataFrame, balance_df: pd.DataFrame, grid_df: pd.DataFrame, ticker: str):
     st.subheader("📊 핵심 성과 지표 (KPI)")
-
-    # KPI 계산
+    
     total_profit = trades_df['profit'].sum()
     total_fees = trades_df['fee'].sum()
-    total_investment = get_total_investment(grid_df)
-    profit_rate = (total_profit / total_investment) * 100 if total_investment > 0 else 0
+    invested_capital = grid_df[grid_df['is_bought'] == True]['order_krw_amount'].sum()
+    profit_rate = (total_profit / invested_capital) * 100 if invested_capital > 0 else 0
     
-    total_volume = trades_df['amount'].sum()
-    fee_rate = (total_fees / total_volume) * 100 if total_volume > 0 else 0
-
-    total_trades = len(trades_df)
-    buy_count = len(trades_df[trades_df['buy_sell'] == 'buy'])
-    sell_count = len(trades_df[trades_df['buy_sell'] == 'sell'])
-
     latest_balance = balance_df.iloc[-1] if not balance_df.empty else None
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
-        profit_color = "normal" if total_profit >= 0 else "inverse"
-        st.metric(
-            label="💰 총 수익",
-            value=f"{total_profit:,.0f} 원",
-            delta=f"투자 대비 {profit_rate:+.2f}%",
-            delta_color=profit_color
-        )
-
+        st.metric("💰 총 수익", f"{total_profit:,.0f} 원", f"투자 대비 {profit_rate:+.2f}%", delta_color="normal" if total_profit >= 0 else "inverse")
     with col2:
-        st.metric(
-            label="🧾 총 수수료",
-            value=f"{total_fees:,.0f} 원",
-            delta=f"거래량 대비 {fee_rate:.4f}%",
-            delta_color="off"
-        )
-
+        st.metric("🧾 총 수수료", f"{total_fees:,.0f} 원")
     with col3:
-        st.metric(
-            label="📊 총 거래",
-            value=f"{total_trades} 회",
-            delta=f"매수 {buy_count} / 매도 {sell_count}"
-        )
-
+        st.metric("📊 총 거래", f"{len(trades_df)} 회", f"매수 {len(trades_df[trades_df['buy_sell'] == 'buy'])} / 매도 {len(trades_df[trades_df['buy_sell'] == 'sell'])}")
     with col4:
         if latest_balance is not None:
+            total_assets_val = latest_balance['total_assets']
+            krw_balance_val = latest_balance['krw_balance']
+            coin_balance_val = latest_balance['coin_balance']
+            coin_symbol = ticker.replace("KRW-", "")
+            
             st.metric(
                 label="🏦 현재 총 자산",
-                value=f"{latest_balance['total_assets']:,.0f} 원" + format_korean_won(latest_balance['total_assets']),
+                value=f"{total_assets_val:,.0f} 원",
+                help=f"현금: {krw_balance_val:,.0f} 원\n코인: {coin_balance_val:.8f} {coin_symbol}"
             )
         else:
             st.metric("🏦 현재 총 자산", "정보 없음")
 
-    with col5:
-        if latest_balance is not None:
-            coin_value = latest_balance['coin_balance'] * latest_balance['current_price']
-            st.metric(
-                label="💎 보유 코인 가치",
-                value=f"{coin_value:,.0f} 원" + format_korean_won(coin_value),
-            )
-        else:
-            st.metric("💎 보유 코인 가치", "정보 없음")
-
-def display_grid_status(grid_df, current_price):
-    """그리드 현황을 Expander 안에 표시합니다."""
-    with st.expander("🔲 그리드 현황 보기", expanded=False):
-        if grid_df.empty:
-            st.info("현재 활성화된 그리드가 없습니다.")
-            return
-
-        grid_display = grid_df.copy()
-        grid_display.rename(columns={
-            'grid_level': '구간', 'buy_price_target': '매수 목표가', 'sell_price_target': '매도 목표가',
-            'order_krw_amount': '주문 금액', 'is_bought': '매수 상태', 'actual_bought_volume': '실제 매수량',
-            'actual_buy_fill_price': '평균 매수가', 'timestamp': '최종 업데이트'
-        }, inplace=True)
-
-        # 포맷팅
-        for col in ['매수 목표가', '매도 목표가', '평균 매수가']:
-            grid_display[col] = grid_display[col].apply(lambda x: f"{x:,.2f}" if x > 0 else "-")
-        grid_display['주문 금액'] = grid_display['주문 금액'].apply(lambda x: f"{x:,.0f}")
-        grid_display['실제 매수량'] = grid_display['실제 매수량'].apply(lambda x: f"{x:.8f}" if x > 0 else "-")
-        grid_display['매수 상태'] = grid_display['매수 상태'].apply(lambda x: "✅ 매수완료" if x else "⏳ 대기중")
-        grid_display['최종 업데이트'] = pd.to_datetime(grid_display['최종 업데이트']).dt.strftime('%y-%m-%d %H:%M')
-
-        # 현재 가격 강조
-        def highlight_current_grid(row):
-            style = [''] * len(row)
-            try:
-                buy_target = float(row['매수 목표가'])
-                sell_target = float(row['매도 목표가'])
-                if current_price and buy_target < current_price <= sell_target:
-                    style = ['background-color: #444444'] * len(row)
-            except (ValueError, TypeError):
-                pass
-            return style
+def display_processed_tables(grid_df: pd.DataFrame, trades_df: pd.DataFrame):
+    st.markdown("---")
+    
+    # --- 그리드 현황 ---
+    st.subheader("🔲 그리드 현황")
+    if grid_df is None or grid_df.empty:
+        st.info("그리드 정보가 없습니다.")
+    else:
+        # 각 grid_level의 최신 데이터만 선택
+        latest_grid_df = grid_df.loc[grid_df.groupby('grid_level')['timestamp'].idxmax()]
         
-        st.dataframe(
-            grid_display.style.apply(highlight_current_grid, axis=1),
-            use_container_width=True, hide_index=True
-        )
+        grid_display_df = pd.DataFrame({
+            "구간": latest_grid_df['grid_level'],
+            "상태": latest_grid_df['is_bought'].apply(lambda x: "🟢 매수완료" if x else "⚪ 대기"),
+            "매수 목표가": latest_grid_df['buy_price_target'].apply(lambda x: f"{x:,.0f}"),
+            "매도 목표가": latest_grid_df['sell_price_target'].apply(lambda x: f"{x:,.0f}"),
+            "실제 매수가": latest_grid_df['actual_buy_fill_price'].apply(lambda x: f"{x:,.0f}" if x > 0 else "-"),
+            "보유량": latest_grid_df['actual_bought_volume'].apply(lambda x: f"{x:.8f}" if x > 0 else "-"),
+            "주문액": latest_grid_df['order_krw_amount'].apply(lambda x: f"{x:,.0f}"),
+        }).sort_values(by="구간").set_index("구간")
+        st.dataframe(grid_display_df, use_container_width=True)
 
-def display_trade_history(trades_df):
-    """거래 내역을 Expander 안에 표시합니다."""
-    with st.expander("🧾 거래 내역 보기", expanded=False):
-        if trades_df.empty:
-            st.info("거래 내역이 없습니다.")
-            return
-        
-        trades_display = trades_df[['timestamp', 'buy_sell', 'grid_level', 'price', 'amount', 'volume', 'fee', 'profit', 'profit_percentage']].copy()
-        trades_display.rename(columns={
-            'timestamp': '시간', 'buy_sell': '유형', 'grid_level': '레벨', 'price': '가격',
-            'amount': '거래액', 'volume': '수량', 'fee': '수수료', 'profit': '수익', 'profit_percentage': '수익률(%)'
-        }, inplace=True)
+    # --- 거래 내역 ---
+    st.subheader("🧾 최근 거래 내역")
+    if trades_df is None or trades_df.empty:
+        st.info("거래 내역이 없습니다.")
+    else:
+        trades_display_df = pd.DataFrame({
+            "시간": pd.to_datetime(trades_df['timestamp']).dt.strftime('%m-%d %H:%M:%S'),
+            "종류": trades_df['buy_sell'].apply(lambda x: "매수" if x == 'buy' else "매도"),
+            "구간": trades_df['grid_level'],
+            "체결가": trades_df['price'].apply(lambda x: f"{x:,.0f}"),
+            "체결량": trades_df['volume'].apply(lambda x: f"{x:.8f}"),
+            "체결액(원)": trades_df['amount'].apply(lambda x: f"{x:,.0f}"),
+            "수수료(원)": trades_df['fee'].apply(lambda x: f"{x:,.0f}"),
+            "수익(원)": trades_df.apply(lambda row: f"{row['profit']:+,}" if row['buy_sell'] == 'sell' else "-", axis=1),
+        }).set_index("시간")
+        st.dataframe(trades_display_df.head(15), use_container_width=True)
 
-        trades_display['시간'] = pd.to_datetime(trades_display['시간']).dt.strftime('%y-%m-%d %H:%M')
-        trades_display['유형'] = trades_display['유형'].map({'buy': '매수', 'sell': '매도'})
-        
-        for col in ['가격', '거래액', '수수료', '수익']:
-            trades_display[col] = trades_display[col].apply(lambda x: f"{x:,.0f}")
-        trades_display['수익률(%)'] = trades_display['수익률(%)'].apply(lambda x: f"{x:+.2f}" if pd.notnull(x) else "-")
-        trades_display['수량'] = trades_display['수량'].apply(lambda x: f"{x:.6f}")
 
-        st.dataframe(trades_display, use_container_width=True, hide_index=True, height=300)
+def display_footer_status(first_start_time: Optional[datetime], session_start_time: Optional[datetime]):
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown("---")
+    
+    def format_uptime(start_dt: Optional[datetime]) -> str:
+        if not start_dt: return "정보 없음"
+        uptime = datetime.now(KST) - start_dt
+        days, rem = divmod(uptime.total_seconds(), 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        return f"{int(days)}일 {int(hours)}시간 {int(minutes)}분"
 
-# --- 메인 대시보드 ---
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"**🌱 최초 시작**")
+        st.code(f"{first_start_time.strftime('%Y-%m-%d %H:%M') if first_start_time else 'N/A'}")
+    with col2:
+        st.markdown(f"**📈 총 누적 운영**")
+        st.code(f"{format_uptime(first_start_time)}")
+    with col3:
+        st.markdown(f"**🔄 현 세션 시작**")
+        st.code(f"{session_start_time.strftime('%Y-%m-%d %H:%M') if session_start_time else 'N/A'}")
+    with col4:
+        st.markdown(f"**⏳ 현 세션 운영**")
+        st.code(f"{format_uptime(session_start_time)}")
 
-def main():
-    st.set_page_config(page_title="그리드 트레이딩 대시보드", page_icon="📈", layout="wide")
-    st.title("📈 업비트 그리드 트레이딩 대시보드")
+# --- 메인 대시보드 실행 ---
+def main(ticker: str):
+    st.set_page_config(page_title=f"{ticker} 트레이딩 대시보드", page_icon="📈", layout="wide")
+    coin_name = get_coin_name(ticker)
+    st.title(f"📈 {ticker} ({coin_name}) 트레이딩 대시보드")
 
     placeholder = st.empty()
 
     while True:
         with placeholder.container():
-            TICKER = get_current_ticker()
-            trades_df, balance_df, grid_df = load_data(TICKER)
+            trades_df, balance_df, grid_df = load_data(ticker)
             
-            start_time = get_start_time()
-            current_price = balance_df.iloc[-1]['current_price'] if not balance_df.empty else None
-            coin_name = get_coin_name(TICKER)
+            if balance_df is None or balance_df.empty:
+                st.warning(f"{ticker}에 대한 데이터가 없습니다. 봇이 실행 중인지 확인하세요.")
+                time.sleep(REFRESH_INTERVAL)
+                continue
 
-            # 헤더
+            current_price = balance_df.iloc[-1]['current_price']
             price_str = f"{current_price:,.2f} 원" if current_price else "정보 없음"
-            st.markdown(f"### **{TICKER}** ({coin_name}) | 현재가: **{price_str}**")
+            st.markdown(f"#### 현재가: **{price_str}** (업데이트: {datetime.now(KST).strftime('%H:%M:%S')})")
             
-            # 봇 상태
-            display_bot_status(start_time)
+            display_kpi_metrics(trades_df, balance_df, grid_df, ticker)
+            display_processed_tables(grid_df, trades_df)
 
-            # KPI
-            display_kpi_metrics(trades_df, balance_df, grid_df)
-            
-            st.markdown("---")
-
-            # 상세 정보
-            display_grid_status(grid_df, current_price)
-            display_trade_history(trades_df)
+            first_start_time = get_first_start_time(ticker)
+            session_start_time = get_session_start_time(ticker)
+            display_footer_status(first_start_time, session_start_time)
 
         time.sleep(REFRESH_INTERVAL)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Upbit 그리드 트레이딩 대시보드")
+    parser.add_argument("--ticker", type=str, help="표시할 코인 티커 (예: KRW-BTC)", required=True)
+    args = parser.parse_args()
+    main(args.ticker)

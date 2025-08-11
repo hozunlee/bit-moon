@@ -1,19 +1,20 @@
 """
-Upbit 자동 매매 봇 메인 모듈
+Upbit 자동 매매 봇 메인 모듈 (다중 코인 실행 지원)
 """
 
 # 기본 라이브러리 임포트
-import os  # 운영체제 관련 기능 사용
-import time  # 시간 지연 및 시간 관련 기능
-import logging  # 로깅 기능
-import sys  # 시스템 관련 기능
-from datetime import datetime, timedelta  # 날짜/시간 처리
-from typing import Dict, List, Optional, Any, Union
+import os
+import time
+import logging
+import sys
+import argparse
+from datetime import datetime
+from typing import Dict, Optional, Any
 
 # 서드파티 라이브러리
-import pyupbit  # 업비트 API 연동
-import requests  # HTTP 요청
-from dotenv import load_dotenv  # 환경변수 관리
+import pyupbit
+import requests
+from dotenv import load_dotenv
 
 # Python 3.12 sqlite3 호환성을 위한 설정
 import sqlite3
@@ -24,232 +25,41 @@ sqlite3.register_converter("timestamp", lambda x: datetime.strptime(x.decode(), 
 if sys.platform == 'win32':
     import winsound
 
-def load_environment() -> None:
-    """Load environment variables and validate required ones."""
-    # .env 파일에서 환경변수 로드
-    load_dotenv()
-    
-    # 필수 환경변수 확인
-    required_vars = ["UPBIT_ACCESS_KEY", "UPBIT_SECRET_KEY"]
-    missing_vars = [var for var in required_vars if not os.environ.get(var)]
-    
-    if missing_vars:
-        error_msg = f"필수 환경변수가 설정되지 않았습니다: {', '.join(missing_vars)}. .env 파일을 확인해주세요."
-        raise EnvironmentError(error_msg)
+# --- 설정 및 전역 변수 선언 ---
 
-# 설정 가져오기
-from config.config import APIConfig, TradingConfig, DBConfig
+# 설정 클래스 임포트
+from config.config import APIConfig, TradingConfig, PathConfig
 
-# API 키 설정
+# API 설정 (환경변수에서 로드)
+load_dotenv()
 ACCESS_KEY = APIConfig.ACCESS_KEY
 SECRET_KEY = APIConfig.SECRET_KEY
 DISCORD_WEBHOOK_URL = APIConfig.DISCORD_WEBHOOK_URL
 
-# 거래 설정
-TICKER = TradingConfig.TICKER
-BASE_PRICE = TradingConfig.BASE_PRICE
-PRICE_CHANGE = TradingConfig.PRICE_CHANGE
-MAX_GRID_COUNT = TradingConfig.MAX_GRID_COUNT
-ORDER_AMOUNT = TradingConfig.ORDER_AMOUNT
-CHECK_INTERVAL = TradingConfig.CHECK_INTERVAL
-FEE_RATE = TradingConfig.FEE_RATE
-DISCORD_LOGGING = TradingConfig.DISCORD_LOGGING
-PLAY_SOUND = TradingConfig.PLAY_SOUND
+# 거래 관련 전역 변수 (실행 시 동적으로 설정됨)
+TICKER: Optional[str] = None
+BASE_PRICE: Optional[float] = None
+PRICE_CHANGE: Optional[float] = None
+GRID_INTERVAL_PERCENT: Optional[float] = None  # 동적 그리드 간격 퍼센트
+MAX_GRID_COUNT: Optional[int] = None
+ORDER_AMOUNT: Optional[float] = None
+CHECK_INTERVAL: Optional[int] = None
+FEE_RATE: Optional[float] = None
+DISCORD_LOGGING: Optional[bool] = None
+PLAY_SOUND: Optional[bool] = None
 
-# 전역 변수
-current_price = 0  # 현재 코인 가격
-previous_price = None  # 이전 가격
-grid_orders = []  # 그리드 주문 목록
-trade_history = []  # 거래 내역
+# 시스템 관련 전역 변수
+DB_FILE: Optional[str] = None
+logger = logging.getLogger()
+upbit: Optional[pyupbit.Upbit] = None
+discord_logger: 'DiscordLogger'
 
-# 데이터베이스 파일 경로
-DB_FILE = DBConfig.get_db_filename()
+# 상태 관련 전역 변수
+current_price: float = 0
+previous_price: Optional[float] = None
+grid_orders: list = []
+trade_history: list = []
 
-def init_db():
-    """데이터베이스 초기화 및 테이블 생성"""
-    try:
-        # 새로운 데이터베이스 파일 생성
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        logger.info(f"새로운 데이터베이스 파일 생성: {DB_FILE}")
-        
-        # GRID(구간) 테이블
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS grid (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT,
-            grid_level INTEGER,
-            buy_price_target REAL,
-            sell_price_target REAL,
-            order_krw_amount REAL,
-            is_bought BOOLEAN,
-            actual_bought_volume REAL,
-            actual_buy_fill_price REAL,
-            timestamp TEXT DEFAULT (datetime('now', 'localtime'))
-        )
-        ''')
-        
-        # 거래 내역 테이블
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticker TEXT,
-            buy_sell TEXT,
-            grid_level INTEGER,
-            price REAL,
-            amount REAL,
-            volume REAL,
-            fee REAL,
-            profit REAL,
-            profit_percentage REAL,
-            timestamp TEXT DEFAULT (datetime('now', 'localtime'))
-        )
-        ''')
-        
-        # 잔고 현황 테이블
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS balance_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            krw_balance REAL,
-            coin_balance REAL,
-            coin_avg_price REAL,
-            total_assets REAL,
-            current_price REAL,
-            timestamp TEXT DEFAULT (datetime('now', 'localtime'))
-        )
-        ''')
-        
-        conn.commit()
-        logger.info("데이터베이스 초기화 완료")
-    except Exception as e:
-        logger.error(f"데이터베이스 초기화 중 오류 발생: {str(e)}")
-    finally:
-        conn.close()
-
-def save_trade(trade_data):
-    """거래 내역을 데이터베이스에 저장"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        INSERT INTO trades (
-            ticker, buy_sell, grid_level, price, amount, 
-            volume, fee, profit, profit_percentage, timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            TICKER,  # ticker 추가
-            trade_data['type'],  # buy_sell 컬럼에 type 값 저장
-            trade_data['grid_level'],
-            trade_data['price'],
-            trade_data['amount'],
-            trade_data['volume'],
-            trade_data.get('fee', 0),
-            trade_data.get('profit', 0),
-            trade_data.get('profit_percentage', 0),
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # 문자열로 변환
-        ))
-        
-        conn.commit()
-    except Exception as e:
-        logger.error(f"거래 내역 저장 중 오류 발생: {str(e)}")
-    finally:
-        conn.close()
-
-def save_balance(balance_data):
-    """잔고 현황을 데이터베이스에 저장"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        INSERT INTO balance_history (
-            timestamp, krw_balance, coin_balance, 
-            coin_avg_price, total_assets, current_price
-        ) VALUES (?, ?, ?, ?, ?, ?)
-        ''', (
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # 문자열로 변환
-            balance_data['krw'],
-            balance_data['coin'],
-            balance_data['coin_avg_price'],
-            balance_data['total_assets'],
-            current_price
-        ))
-        
-        conn.commit()
-    except Exception as e:
-        logger.error(f"잔고 현황 저장 중 오류 발생: {str(e)}")
-    finally:
-        conn.close()
-
-def save_grid(grid_data):
-    """그리드 상태를 데이터베이스에 업데이트"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        
-        # 해당 그리드 레벨의 최신 레코드 확인 (ticker 조건 추가)
-        cursor.execute('''
-        SELECT id FROM grid 
-        WHERE grid_level = ? AND ticker = ?
-        ORDER BY timestamp DESC 
-        LIMIT 1
-        ''', (grid_data['level'], TICKER))
-        
-        result = cursor.fetchone()
-        
-        if result:
-            # 기존 레코드가 있으면 업데이트
-            cursor.execute('''
-            UPDATE grid SET
-                buy_price_target = ?,
-                sell_price_target = ?,
-                order_krw_amount = ?,
-                is_bought = ?,
-                actual_bought_volume = ?,
-                actual_buy_fill_price = ?,
-                timestamp = ?
-            WHERE id = ?
-            ''', (
-                grid_data['buy_price_target'],
-                grid_data['sell_price_target'],
-                grid_data['order_krw_amount'],
-                grid_data['is_bought'],
-                grid_data['actual_bought_volume'],
-                grid_data['actual_buy_fill_price'],
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # 문자열로 변환
-                result[0]
-            ))
-            logger.info(f"그리드 레벨 {grid_data['level']} 상태 업데이트 완료")
-        else:
-            # 기존 레코드가 없으면 새로 삽입 (ticker 포함)
-            cursor.execute('''
-            INSERT INTO grid (
-                ticker, grid_level, buy_price_target, sell_price_target,
-                order_krw_amount, is_bought, actual_bought_volume,
-                actual_buy_fill_price
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                TICKER,  # ticker 추가
-                grid_data['level'],
-                grid_data['buy_price_target'],
-                grid_data['sell_price_target'],
-                grid_data['order_krw_amount'],
-                grid_data['is_bought'],
-                grid_data['actual_bought_volume'],
-                grid_data['actual_buy_fill_price']
-            ))
-            logger.info(f"그리드 레벨 {grid_data['level']} 새 상태 저장 완료")
-        
-        conn.commit()
-    except Exception as e:
-        logger.error(f"그리드 상태 저장 중 오류 발생: {str(e)}")
-    finally:
-        conn.close()
-
-# Upbit 객체 생성
-upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
 
 class DiscordLogger:
     """디스코드로 로그를 전송하는 전용 로거"""
@@ -258,551 +68,448 @@ class DiscordLogger:
         self.enabled = bool(webhook_url)
 
     def send(self, message, level="INFO"):
-        """디스코드로 메시지 전송
-        level: INFO(초록색), WARNING(노란색), ERROR(빨간색)
-        """
         if not self.enabled:
             return
-
         try:
-            color = {
-                'INFO': 0x00ff00,    # 초록색
-                'WARNING': 0xffff00,  # 노란색
-                'ERROR': 0xff0000,    # 빨간색
-                'CRITICAL': 0xff0000  # 빨간색
-            }.get(level, 0x808080)  # 기본 회색
-
+            color = {'INFO': 0x00ff00, 'WARNING': 0xffff00, 'ERROR': 0xff0000, 'CRITICAL': 0xff0000}.get(level, 0x808080)
             kst_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            payload = {
-                "embeds": [{
-                    "title": f"[{level}]",
-                    "description": f"{message}\n\n{kst_time} (KST)",
-                    "color": color
-                }]
-            }
+            payload = {"embeds": [{"title": f"[{TICKER} - {level}]", "description": f"{message}\n\n{kst_time} (KST)", "color": color}]}
             requests.post(self.webhook_url, json=payload)
         except Exception as e:
             print(f"Discord 로그 전송 중 오류 발생: {str(e)}")
 
-discord_logger = DiscordLogger(DISCORD_WEBHOOK_URL)
 
-log_file = f"{TICKER.replace('KRW-', '').lower()}_grid_trade.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger()
-file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s', 
-                                          datefmt='%Y-%m-%d %H:%M:%S'))
-logger.addHandler(file_handler)
-logger.info("로깅 설정 완료")
+def setup_logging(ticker: str) -> None:
+    """티커에 따라 로깅 설정을 초기화합니다."""
+    path_config = PathConfig(ticker)
+    log_file = path_config.get_log_filename()
 
-def get_current_price():
-    """현재 가격 조회"""
-    logger.info("get_current_price")
-    global current_price, previous_price
+    # 기존 핸들러 제거
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
 
-    try:
-        ticker_price = pyupbit.get_current_price(TICKER)
-        if 'previous_price' not in globals() or previous_price is None:
-            previous_price = ticker_price
-        if 'current_price' not in globals() or current_price == 0:
-            current_price = ticker_price
-
-        price_change_val = 0
-        change_percentage = 0
-        if previous_price is not None and previous_price > 0 : # Modified to check previous_price > 0
-            price_change_val = ticker_price - previous_price
-            change_percentage = (price_change_val / previous_price) * 100
-        
-        sign = "+" if price_change_val >= 0 else ""
-        base_price_str = f"{BASE_PRICE:,.2f}원" if BASE_PRICE is not None else "미설정"
-        
-        grid_level_info = "미설정"
-        if BASE_PRICE is not None and grid_orders:
-            for grid_item in grid_orders:
-                if grid_item['buy_price_target'] >= ticker_price > grid_item['buy_price_target'] - PRICE_CHANGE:
-                    grid_level_info = f"구간 {grid_item['level']} 매수 목표가({grid_item['buy_price_target']:,.2f}원) 근접"
-                    break
-            else:
-                if grid_orders and ticker_price > grid_orders[0]['buy_price_target']:
-                  grid_level_info = "최상단 매수 구간 초과"
-                elif grid_orders and ticker_price < grid_orders[-1]['buy_price_target'] - PRICE_CHANGE : # Check against last grid
-                  grid_level_info = "최하단 매수 구간 미만"
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[logging.StreamHandler()]
+    )
+    file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    file_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+    logger.addHandler(file_handler)
+    logger.info(f"'{ticker}'에 대한 로깅 설정 완료. 로그 파일: {log_file}")
 
 
-        price_msg = f"현재 {TICKER} 가격: {ticker_price:,.2f}원, 기준가: {base_price_str}, {grid_level_info}, ({sign}{change_percentage:.2f}%), {sign}{price_change_val:.2f}원 {'상승' if price_change_val >= 0 else '하락'}"
-        logger.info(price_msg)
-        
-        previous_price = ticker_price
-        current_price = ticker_price
+def setup_application(ticker: str) -> bool:
+    """커맨드 라인 인자를 기반으로 애플리케이션 설정을 초기화합니다."""
+    global TICKER, BASE_PRICE, PRICE_CHANGE, GRID_INTERVAL_PERCENT, MAX_GRID_COUNT, ORDER_AMOUNT
+    global CHECK_INTERVAL, FEE_RATE, DISCORD_LOGGING, PLAY_SOUND
+    global DB_FILE, upbit, discord_logger
 
-        logger.info("/get_current_price\\n")
-        return ticker_price
-
-    except Exception as e:
-        logger.error(f"가격 조회 중 오류 발생: {str(e)}")
-        return None
-
-
-def get_balance():
-    """계좌 잔고 조회"""
-    logger.info("get_balance")
-
-    try:
-        krw_balance = upbit.get_balance("KRW")
-        
-        print(">>>>>>>>>>>>>>>>>>>", upbit.get_balance('KRW'))
-        coin_balance = upbit.get_balance(TICKER)
-        coin_avg_price = upbit.get_avg_buy_price(TICKER) if upbit.get_balance(TICKER) > 0 else 0
-
-        logger.info(f"보유 원화: {krw_balance:,.0f}원")
-        logger.info(f"보유 {TICKER}: {coin_balance:.8f} {TICKER}")
-
-        current_coin_value = 0
-        if coin_balance > 0 and current_price > 0 : # Ensure current_price is available
-            current_coin_value = coin_balance * current_price
-            total_investment = coin_balance * coin_avg_price
-            profit = current_coin_value - total_investment
-            profit_percentage = (profit / total_investment) * 100 if total_investment > 0 else 0
-            
-            logger.info(f"{TICKER} 평균 매수가: {coin_avg_price:,.2f}원")
-            logger.info(f"평가 금액: {current_coin_value:,.0f}원")
-            logger.info(f"수익금: {profit:+,.0f}원 ({profit_percentage:+.2f}%)")
-
-        total_assets = krw_balance + current_coin_value
-        logger.info(f"총 자산: {total_assets:,.0f}원")
-
-        logger.info("/get_balance\\n")
-        balance_data = {
-            "krw": krw_balance,
-            "coin": coin_balance,
-            "coin_avg_price": coin_avg_price,
-            "total_assets": total_assets
-        }
-        
-        save_balance(balance_data)  # 잔고 현황 저장
-        
-        return balance_data
-    except Exception as e:
-        logger.error(f"잔고 조회 중 오류 발생: {str(e)}")
-        return None
-
-
-def create_grid_orders(input_base_price=None):
-    """분할 매수/매도 그리드 주문 생성"""
-    logger.info("create_grid_orders")
-    global grid_orders, BASE_PRICE
-
-    current_market_price = get_current_price()
-    if current_market_price is None:
-        logger.error("현재 가격을 가져올 수 없습니다. 그리드 생성을 중단합니다.")
+    # 1. 티커에 맞는 설정 로드
+    coin_config = TradingConfig.get_coin_config(ticker)
+    if not coin_config:
+        logger.error(f"'{ticker}'에 대한 설정을 config.py에서 찾을 수 없습니다.")
         return False
 
-    if input_base_price is not None:
-        BASE_PRICE = input_base_price
-        logger.info(f"사용자 지정 기준 가격: {BASE_PRICE:,.2f}원")
-    else:
-        # 현재가를 기준가로 설정
-        BASE_PRICE = current_market_price
-        logger.info(f"현재 시장 가격: {current_market_price:,.2f}원")
-        logger.info(f"기준 가격 설정 (현재가 기준): {BASE_PRICE:,.2f}원")
+    # 2. 전역 변수 설정
+    TICKER = coin_config["TICKER"]
+    BASE_PRICE = coin_config["BASE_PRICE"]
+    PRICE_CHANGE = coin_config.get("PRICE_CHANGE", 0)
+    GRID_INTERVAL_PERCENT = coin_config.get("GRID_INTERVAL_PERCENT", 0)
+    MAX_GRID_COUNT = coin_config["MAX_GRID_COUNT"]
+    ORDER_AMOUNT = coin_config["ORDER_AMOUNT"]
 
-    # 즉시 시장가 매수 제거 - 그리드 조건을 만족할 때만 매수 실행
-    logger.info("그리드 조건을 만족할 때 매수를 실행합니다.")
+    CHECK_INTERVAL = TradingConfig.CHECK_INTERVAL
+    FEE_RATE = TradingConfig.FEE_RATE
+    DISCORD_LOGGING = TradingConfig.DISCORD_LOGGING
+    PLAY_SOUND = TradingConfig.PLAY_SOUND
 
-    grid_orders = []
+    # 3. 티커 기반 경로 및 클라이언트 초기화
+    path_config = PathConfig(ticker)
+    DB_FILE = path_config.get_db_filename()
     
-    # 현재가 위아래로 그리드 생성
-    for i in range(MAX_GRID_COUNT):
-        # 현재가 아래쪽 그리드들 (매수 구간)
-        buy_target_price = BASE_PRICE - (i * PRICE_CHANGE)
-        sell_target_price = buy_target_price + PRICE_CHANGE
+    # 4. 로깅 재설정
+    setup_logging(ticker)
 
-        grid = {
-            'level': i + 1,
-            'buy_price_target': buy_target_price,
-            'sell_price_target': sell_target_price,
-            'buy_price_min': buy_target_price - PRICE_CHANGE,  # 매수 구간 하한
-            'order_krw_amount': ORDER_AMOUNT,
-            'is_bought': False,
-            'actual_bought_volume': 0.0,
-            'actual_buy_fill_price': 0.0
-        }
-        grid_orders.append(grid)
-        save_grid(grid)  # 각 그리드 생성 시 저장
+    # 5. Upbit 및 Discord 클라이언트 초기화
+    if not all([ACCESS_KEY, SECRET_KEY]):
+        logger.error("API 키가 설정되지 않았습니다. .env 파일을 확인해주세요.")
+        return False
+    upbit = pyupbit.Upbit(ACCESS_KEY, SECRET_KEY)
+    discord_logger = DiscordLogger(DISCORD_WEBHOOK_URL)
 
-    logger.info(f"총 {len(grid_orders)}개의 그리드 주문 설정 생성됨")
-    logger.info(f"매수/매도 가격 간격: {PRICE_CHANGE}원")
-    logger.info(f"주문당 KRW 금액: {ORDER_AMOUNT:,}원")
-    for grid in grid_orders:
-        logger.info(
-            f"{grid['level']}차: 매수구간 {grid['buy_price_min']:,.2f}~{grid['buy_price_target']:,.2f}원, 매도 목표가 {grid['sell_price_target']:,.2f}원")
-
-    logger.info("/create_grid_orders\\n")
+    logger.info(f"'{TICKER}' 애플리케이션 설정 완료.")
     return True
 
 
+def init_db():
+    """데이터베이스 초기화 및 테이블 생성"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            logger.info(f"데이터베이스 연결: {DB_FILE}")
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS grid (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, grid_level INTEGER,
+                buy_price_target REAL, sell_price_target REAL, order_krw_amount REAL,
+                is_bought BOOLEAN, actual_bought_volume REAL, actual_buy_fill_price REAL,
+                timestamp TEXT DEFAULT (datetime('now', 'localtime'))
+            )''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, buy_sell TEXT, grid_level INTEGER,
+                price REAL, amount REAL, volume REAL, fee REAL, profit REAL, profit_percentage REAL,
+                timestamp TEXT DEFAULT (datetime('now', 'localtime'))
+            )''')
+            
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balance_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, krw_balance REAL, coin_balance REAL,
+                coin_avg_price REAL, total_assets REAL, current_price REAL,
+                timestamp TEXT DEFAULT (datetime('now', 'localtime'))
+            )''')
+            conn.commit()
+            logger.info("데이터베이스 초기화 완료")
+    except Exception as e:
+        logger.error(f"데이터베이스 초기화 중 오류 발생: {e}")
+
+# ... (save_trade, save_balance, save_grid 함수들은 DB_FILE과 TICKER 전역 변수를 사용하므로 수정 불필요) ...
+def save_trade(trade_data):
+    """거래 내역을 데이터베이스에 저장"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT INTO trades (
+                ticker, buy_sell, grid_level, price, amount, 
+                volume, fee, profit, profit_percentage, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                TICKER, trade_data['type'], trade_data['grid_level'], trade_data['price'],
+                trade_data['amount'], trade_data['volume'], trade_data.get('fee', 0),
+                trade_data.get('profit', 0), trade_data.get('profit_percentage', 0),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"거래 내역 저장 중 오류 발생: {e}")
+
+def save_balance(balance_data):
+    """잔고 현황을 데이터베이스에 저장"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT INTO balance_history (
+                timestamp, krw_balance, coin_balance, 
+                coin_avg_price, total_assets, current_price
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'), balance_data['krw'],
+                balance_data['coin'], balance_data['coin_avg_price'],
+                balance_data['total_assets'], current_price
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"잔고 현황 저장 중 오류 발생: {e}")
+
+def save_grid(grid_data):
+    """그리드 상태를 데이터베이스에 업데이트"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM grid WHERE grid_level = ? AND ticker = ? ORDER BY timestamp DESC LIMIT 1', (grid_data['level'], TICKER))
+            result = cursor.fetchone()
+            
+            if result:
+                cursor.execute('''
+                UPDATE grid SET
+                    buy_price_target = ?, sell_price_target = ?, order_krw_amount = ?, is_bought = ?,
+                    actual_bought_volume = ?, actual_buy_fill_price = ?, timestamp = ?
+                WHERE id = ?
+                ''', (
+                    grid_data['buy_price_target'], grid_data['sell_price_target'], grid_data['order_krw_amount'],
+                    grid_data['is_bought'], grid_data['actual_bought_volume'], grid_data['actual_buy_fill_price'],
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'), result[0]
+                ))
+            else:
+                cursor.execute('''
+                INSERT INTO grid (
+                    ticker, grid_level, buy_price_target, sell_price_target, order_krw_amount,
+                    is_bought, actual_bought_volume, actual_buy_fill_price
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    TICKER, grid_data['level'], grid_data['buy_price_target'], grid_data['sell_price_target'],
+                    grid_data['order_krw_amount'], grid_data['is_bought'],
+                    grid_data['actual_bought_volume'], grid_data['actual_buy_fill_price']
+                ))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"그리드 상태 저장 중 오류 발생: {e}")
+
+
+def get_current_price():
+    """현재 가격 조회"""
+    global current_price, previous_price
+    try:
+        ticker_price = pyupbit.get_current_price(TICKER)
+        if ticker_price is None:
+            logger.warning("현재가를 가져오지 못했습니다.")
+            return None
+        
+        if previous_price is None: previous_price = ticker_price
+        
+        price_change_val = ticker_price - previous_price
+        change_percentage = (price_change_val / previous_price) * 100 if previous_price > 0 else 0
+        sign = "+" if price_change_val >= 0 else ""
+        
+        logger.info(f"현재 {TICKER} 가격: {ticker_price:,.2f}원 ({sign}{change_percentage:.2f}%)")
+        
+        previous_price = ticker_price
+        current_price = ticker_price
+        return ticker_price
+    except Exception as e:
+        logger.error(f"가격 조회 중 오류 발생: {e}")
+        return None
+
+def get_balance():
+    """계좌 잔고 조회"""
+    try:
+        krw_balance = upbit.get_balance("KRW")
+        coin_balance = upbit.get_balance(TICKER)
+        coin_avg_price = upbit.get_avg_buy_price(TICKER) if coin_balance > 0 else 0
+        
+        current_coin_value = coin_balance * current_price if coin_balance > 0 and current_price > 0 else 0
+        total_assets = krw_balance + current_coin_value
+
+        logger.info(f"잔고: {krw_balance:,.0f}원, {TICKER} {coin_balance:.8f}개, 총 자산 {total_assets:,.0f}원")
+
+        balance_data = {"krw": krw_balance, "coin": coin_balance, "coin_avg_price": coin_avg_price, "total_assets": total_assets}
+        save_balance(balance_data)
+        return balance_data
+    except Exception as e:
+        logger.error(f"잔고 조회 중 오류 발생: {e}")
+        return None
+
+def create_grid_orders(input_base_price=None):
+    """분할 매수/매도 그리드 주문 생성 (동적/고정 간격 지원)"""
+    global grid_orders, BASE_PRICE
+    current_market_price = get_current_price()
+    if current_market_price is None:
+        logger.error("현재 가격을 가져올 수 없어 그리드 생성을 중단합니다.")
+        return False
+
+    BASE_PRICE = input_base_price if input_base_price is not None else current_market_price
+    logger.info(f"그리드 기준 가격: {BASE_PRICE:,.2f}원")
+
+    # --- 동적 간격 계산 로직 ---
+    if GRID_INTERVAL_PERCENT and GRID_INTERVAL_PERCENT > 0:
+        # 퍼센트 기반 동적 간격 사용
+        price_change_amount = BASE_PRICE * (GRID_INTERVAL_PERCENT / 100.0)
+        logger.info(f"동적 간격 모드 활성화 ({GRID_INTERVAL_PERCENT}%) -> 계산된 간격: {price_change_amount:,.2f}원")
+    else:
+        # 기존 고정 간격 사용
+        price_change_amount = PRICE_CHANGE
+        logger.info(f"고정 간격 모드 활성화 -> 설정된 간격: {price_change_amount:,.0f}원")
+
+    if price_change_amount <= 0:
+        logger.error("그리드 간격이 0 또는 음수입니다. 설정을 확인해주세요.")
+        return False
+    # --- 로직 종료 ---
+
+    grid_orders = []
+    for i in range(MAX_GRID_COUNT):
+        buy_target_price = BASE_PRICE - (i * price_change_amount)
+        grid = {
+            'level': i + 1,
+            'buy_price_target': buy_target_price,
+            'sell_price_target': buy_target_price + price_change_amount,
+            'buy_price_min': buy_target_price - price_change_amount,
+            'order_krw_amount': ORDER_AMOUNT,
+            'is_bought': False, 'actual_bought_volume': 0.0, 'actual_buy_fill_price': 0.0
+        }
+        grid_orders.append(grid)
+        save_grid(grid)
+
+    logger.info(f"총 {len(grid_orders)}개의 그리드 생성 완료. (주문액: {ORDER_AMOUNT:,.0f}원)")
+    return True
+
 def play_sound(sound_type):
     """거래 알림음 재생"""
+    if not PLAY_SOUND or sys.platform != 'win32': return
     try:
-        if sys.platform != 'win32':
-            logger.info(f"사운드 재생: {sound_type} (Windows 환경에서만 지원)")
-            return
-        if sound_type == 'buy':
-            winsound.PlaySound('res/buy.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
-        elif sound_type == 'sell':
-            winsound.PlaySound('res/sell.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
+        sound_file = f'res/{sound_type}.wav'
+        if os.path.exists(sound_file):
+            winsound.PlaySound(sound_file, winsound.SND_FILENAME | winsound.SND_ASYNC)
+        else:
+            logger.warning(f"사운드 파일 없음: {sound_file}")
     except Exception as e:
-        logger.error(f"알림음 재생 중 오류 발생: {str(e)}")
-        logger.info("알림음 파일(res/buy.wav, res/sell.wav)이 res 폴더에 있는지 확인하세요.")
-
+        logger.error(f"알림음 재생 중 오류: {e}")
 
 def buy_coin(grid_level):
     """지정된 그리드 레벨에서 코인 시장가 매수"""
-    logger.info(f"buy_coin (Level {grid_level})")
-    global current_price
-
     grid = grid_orders[grid_level - 1]
-
-    if grid['is_bought']:
-        logger.info(f"레벨 {grid_level}은 이미 매수 상태입니다.")
-        logger.info("/buy_coin\\n")
-        return False
+    if grid['is_bought']: return False
 
     try:
-        krw_balance = upbit.get_balance("KRW")
-        if krw_balance is None: # Explicitly check for None
-            logger.error("원화 잔고 조회 실패 (buy_coin)")
+        if upbit.get_balance("KRW") < grid['order_krw_amount']:
+            logger.warning(f"잔액 부족으로 매수 불가 (L{grid_level})")
+            return False
+
+        order_response = upbit.buy_market_order(TICKER, grid['order_krw_amount'])
+        if not order_response or 'uuid' not in order_response:
+            logger.error(f"매수 주문 실패 (L{grid_level}): {order_response}")
             return False
         
-        order_krw_amount = grid['order_krw_amount']
-        if krw_balance < order_krw_amount:
-            logger.warning(f"잔액 부족: 매수 불가 (필요: {order_krw_amount:,}원, 보유: {krw_balance:,}원)")
+        time.sleep(2) # 체결 대기
+        order_detail = upbit.get_order(order_response['uuid'])
+
+        actual_volume = float(order_detail.get('executed_volume', 0))
+        actual_price = float(order_detail.get('avg_price', current_price))
+        fee = float(order_detail.get('paid_fee', grid['order_krw_amount'] * FEE_RATE))
+
+        if actual_volume <= 0:
+            logger.error(f"매수 체결 수량 0 (L{grid_level})")
             return False
 
-        # 시장가 매수 시점의 가격 사용
-        actual_fill_price = current_price 
-        if actual_fill_price <= 0: # Prevent division by zero or invalid price
-            logger.error(f"유효하지 않은 시장 가격 ({actual_fill_price})으로 매수 불가.")
-            return False
+        grid.update({'is_bought': True, 'actual_bought_volume': actual_volume, 'actual_buy_fill_price': actual_price})
+        save_grid(grid)
 
-        # 수수료 계산 (KRW 기준)
-        fee_paid_krw = order_krw_amount * FEE_RATE
-        krw_for_coin_purchase = order_krw_amount * (1 - FEE_RATE)
-        actual_bought_volume = krw_for_coin_purchase / actual_fill_price
+        trade = {'type': 'buy', 'grid_level': grid_level, 'price': actual_price, 'amount': grid['order_krw_amount'], 'volume': actual_volume, 'fee': fee}
+        save_trade(trade)
 
-        try:
-            logger.info(f"실제 시장가 매수 시도: {order_krw_amount:,.0f} KRW")
-            order_response = upbit.buy_market_order(TICKER, order_krw_amount)
-            if not order_response or 'uuid' not in order_response: # Check for valid response
-                logger.error(f"매수 주문 실패. 응답: {order_response}")
-                return False
-            
-            logger.info(f"매수 주문 성공: UUID {order_response.get('uuid')}")
-            # 실제 체결 정보를 API 응답에서 추출
-            # 주문 UUID로 체결 정보 확인
-            time.sleep(1)  # 체결 정보가 업데이트될 시간을 주기 위해 약간의 지연
-            try:
-                order_detail = upbit.get_order(order_response.get('uuid'))
-                if order_detail and 'state' in order_detail and order_detail['state'] == 'done':
-                    # 체결된 주문의 경우 실제 체결 정보 사용
-                    executed_volume = float(order_detail.get('executed_volume', '0'))
-                    if executed_volume > 0:
-                        actual_bought_volume = executed_volume
-                    
-                    # 평균 체결가가 있으면 사용
-                    avg_price = order_detail.get('avg_price')
-                    if avg_price:
-                        actual_fill_price = float(avg_price)
-                    
-                    # 지불 수수료 정보가 있으면 사용
-                    paid_fee = order_detail.get('paid_fee')
-                    if paid_fee:
-                        fee_paid_krw = float(paid_fee)
-                
-                logger.info(f"매수 체결 정보: 수량 {actual_bought_volume:.8f}, 평균가 {actual_fill_price:,.2f}원, 수수료 {fee_paid_krw:,.2f}원")
-            except Exception as e:
-                logger.warning(f"체결 정보 조회 중 오류 (기본 추정값 사용): {str(e)}")
-                # 오류 발생 시 기존 계산 값 사용 (기본 값)
-                logger.info(f"기본 추정 매수 정보: 수량 {actual_bought_volume:.8f}, 가격 {actual_fill_price:,.2f}원")
-
-        except Exception as e:
-            logger.error(f"매수 주문 API 호출 중 오류: {str(e)}")
-            return False
-
-        grid['is_bought'] = True
-        grid['actual_bought_volume'] = actual_bought_volume
-        grid['actual_buy_fill_price'] = actual_fill_price
-        save_grid(grid)  # 매수 후 그리드 상태 저장
-
-        trade = {
-            'type': 'buy',
-            'grid_level': grid_level,
-            'price': actual_fill_price,
-            'amount': order_krw_amount, # 총 주문 금액 (KRW)
-            'volume': actual_bought_volume, # 실제 매수된 코인 양
-            'fee': fee_paid_krw, # 지불된 수수료 (KRW)
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        trade_history.append(trade)
-        save_trade(trade)  # 거래 내역 저장
-
-        logger.info(f"매수 완료 (L{grid_level}): {actual_bought_volume:.8f} {TICKER} @ {actual_fill_price:,.2f}원 (주문액: {order_krw_amount:,.0f}원, 수수료: {fee_paid_krw:,.2f}원)")
-        if DISCORD_LOGGING:
-            discord_logger.send(f"매수 완료 (L{grid_level}): {actual_bought_volume:.8f} {TICKER} @ {actual_fill_price:,.2f}원 (주문액: {order_krw_amount:,.0f}원, 수수료: {fee_paid_krw:,.2f}원)", "INFO")
-        if PLAY_SOUND:
-            play_sound('buy')
+        logger.info(f"매수 성공 (L{grid_level}): {actual_volume:.8f} {TICKER} @ {actual_price:,.2f}원")
+        discord_logger.send(f"매수 성공 (L{grid_level}): {actual_volume:.8f} {TICKER} @ {actual_price:,.2f}원", "INFO")
+        play_sound('buy')
         get_balance()
-        logger.info("/buy_coin\\n")
         return True
-
     except Exception as e:
-        logger.error(f"매수 중 오류 발생 (L{grid_level}): {str(e)}")
+        logger.error(f"매수 중 오류 (L{grid_level}): {e}")
         return False
-
 
 def sell_coin(grid_level):
     """지정된 그리드 레벨에서 코인 시장가 매도"""
-    logger.info(f"sell_coin (Level {grid_level})")
-    global current_price
-
     grid = grid_orders[grid_level - 1]
-
-    if not grid['is_bought']:
-        logger.info(f"레벨 {grid_level}은 매수 상태가 아니므로 매도 불가.")
-        return False
-
+    if not grid['is_bought']: return False
+    
     volume_to_sell = grid['actual_bought_volume']
-    if volume_to_sell <= 0:
-        logger.warning(f"레벨 {grid_level} 매도할 코인 수량 없음 ({volume_to_sell:.8f}).")
+    if upbit.get_balance(TICKER) < volume_to_sell:
+        logger.warning(f"보유량 부족으로 매도 불가 (L{grid_level})")
         return False
-        
+
     try:
-        coin_balance = upbit.get_balance(TICKER)
-        if coin_balance is None: # Explicitly check for None
-            logger.error("코인 잔고 조회 실패 (sell_coin)")
+        order_response = upbit.sell_market_order(TICKER, volume_to_sell)
+        if not order_response or 'uuid' not in order_response:
+            logger.error(f"매도 주문 실패 (L{grid_level}): {order_response}")
             return False
 
+        time.sleep(2) # 체결 대기
+        order_detail = upbit.get_order(order_response['uuid'])
 
-        if coin_balance < volume_to_sell:
-            logger.warning(f"{TICKER} 보유량 부족: 매도 불가 (필요: {volume_to_sell:.8f}, 보유: {coin_balance:.8f})")
-            # 부분 매도 로직 추가 가능하나, 현재는 전체 매도 실패로 처리
-            return False
+        actual_price = float(order_detail.get('avg_price', current_price))
+        fee = float(order_detail.get('paid_fee', (volume_to_sell * actual_price) * FEE_RATE))
+        net_sell_krw = (volume_to_sell * actual_price) - fee
+        profit = net_sell_krw - grid['order_krw_amount']
+        profit_percentage = (profit / grid['order_krw_amount']) * 100 if grid['order_krw_amount'] > 0 else 0
 
-        actual_fill_price = current_price # 시장가 매도 시점의 가격 사용
-        if actual_fill_price <= 0:
-            logger.error(f"유효하지 않은 시장 가격 ({actual_fill_price})으로 매도 불가.")
-            return False
+        grid.update({'is_bought': False, 'actual_bought_volume': 0.0, 'actual_buy_fill_price': 0.0})
+        save_grid(grid)
 
-        gross_sell_krw = volume_to_sell * actual_fill_price
-        fee_paid_krw = gross_sell_krw * FEE_RATE
-        net_sell_krw_received = gross_sell_krw * (1 - FEE_RATE)
+        trade = {'type': 'sell', 'grid_level': grid_level, 'price': actual_price, 'amount': net_sell_krw, 'volume': volume_to_sell, 'fee': fee, 'profit': profit, 'profit_percentage': profit_percentage}
+        save_trade(trade)
 
-        try:
-            logger.info(f"실제 시장가 매도 시도: {volume_to_sell:.8f} {TICKER}")
-            order_response = upbit.sell_market_order(TICKER, volume_to_sell)
-            if not order_response or 'uuid' not in order_response:
-                logger.error(f"매도 주문 실패. 응답: {order_response}")
-                return False
-            logger.info(f"매도 주문 성공: UUID {order_response.get('uuid')}")
-            
-            # 실제 체결 정보를 API 응답에서 추출
-            time.sleep(1)  # 체결 정보가 업데이트될 시간을 주기 위해 약간의 지연
-            try:
-                order_detail = upbit.get_order(order_response.get('uuid'))
-                if order_detail and 'state' in order_detail and order_detail['state'] == 'done':
-                    # 체결된 경우 실제 정보 사용
-                    executed_volume = float(order_detail.get('executed_volume', '0'))
-                    if executed_volume > 0:
-                        volume_to_sell = executed_volume  # 실제 매도된 수량으로 업데이트
-                    
-                    # 평균 체결가가 있으면 사용
-                    avg_price = order_detail.get('avg_price')
-                    if avg_price:
-                        actual_fill_price = float(avg_price)
-                        gross_sell_krw = volume_to_sell * actual_fill_price
-                        fee_paid_krw = gross_sell_krw * FEE_RATE
-                        net_sell_krw_received = gross_sell_krw * (1 - FEE_RATE)
-                    
-                    # 지불 수수료 정보가 있으면 사용
-                    paid_fee = order_detail.get('paid_fee')
-                    if paid_fee:
-                        fee_paid_krw = float(paid_fee)
-                        # 수수료가 있으면 순 매도 금액 재계산
-                        net_sell_krw_received = gross_sell_krw - fee_paid_krw
-                
-                logger.info(f"매도 체결 정보: 수량 {volume_to_sell:.8f}, 평균가 {actual_fill_price:,.2f}원, 수수료 {fee_paid_krw:,.2f}원")
-            except Exception as e:
-                logger.warning(f"매도 체결 정보 조회 중 오류 (기본 추정값 사용): {str(e)}")
-                # 오류 발생 시 기존 계산 값 사용
-                logger.info(f"기본 추정 매도 정보: 수량 {volume_to_sell:.8f}, 가격 {actual_fill_price:,.2f}원")
-
-        except Exception as e:
-            logger.error(f"매도 주문 API 호출 중 오류: {str(e)}")
-            return False
-
-        profit_for_this_trade = net_sell_krw_received - grid['order_krw_amount']
-        profit_percentage = (profit_for_this_trade / grid['order_krw_amount']) * 100 if grid['order_krw_amount'] > 0 else 0
-        
-        # 그리드 상태 초기화
-        grid['is_bought'] = False
-        grid['actual_bought_volume'] = 0.0
-        grid['actual_buy_fill_price'] = 0.0
-        save_grid(grid)  # 매도 후 그리드 상태 저장
-        
-        trade = {
-            'type': 'sell',
-            'grid_level': grid_level,
-            'price': actual_fill_price,
-            'amount': net_sell_krw_received, # 실제 받은 KRW (수수료 제외)
-            'volume': volume_to_sell,
-            'fee': fee_paid_krw, # 지불된 수수료 (KRW)
-            'profit': profit_for_this_trade,
-            'profit_percentage': profit_percentage,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        }
-        trade_history.append(trade)
-        save_trade(trade)  # 거래 내역 저장
-
-        logger.info(f"매도 완료 (L{grid_level}): {volume_to_sell:.8f} {TICKER} @ {actual_fill_price:,.2f}원 (실현금액: {net_sell_krw_received:,.0f}원, 수수료: {fee_paid_krw:,.2f}원)")
-        logger.info(f"레벨 {grid_level} 거래 수익: {profit_for_this_trade:+,.0f}원 ({profit_percentage:+.2f}%)")
-        if DISCORD_LOGGING:
-            discord_logger.send(f"매도 완료 (L{grid_level}): {volume_to_sell:.8f} {TICKER} @ {actual_fill_price:,.2f}원 (실현금액: {net_sell_krw_received:,.0f}원)\\n수익: {profit_for_this_trade:+,.0f}원 ({profit_percentage:+.2f}%)", "INFO")
-        if PLAY_SOUND:
-            play_sound('sell')
+        logger.info(f"매도 성공 (L{grid_level}): {volume_to_sell:.8f} {TICKER} @ {actual_price:,.2f}원 | 수익: {profit:+,.0f}원 ({profit_percentage:+.2f}%)")
+        discord_logger.send(f"매도 성공 (L{grid_level}): {volume_to_sell:.8f} {TICKER} @ {actual_price:,.2f}원\n수익: {profit:+,.0f}원 ({profit_percentage:+.2f}%)", "INFO")
+        play_sound('sell')
         get_balance()
-        logger.info("/sell_coin\n")
         return True
-
     except Exception as e:
-        logger.error(f"매도 중 오류 발생 (L{grid_level}): {str(e)}")
+        logger.error(f"매도 중 오류 (L{grid_level}): {e}")
         return False
-
 
 def check_price_and_trade():
-    """현재 가격을 확인하고 모든 그리드 주문에 대해 거래 실행"""
-    logger.info("check_price_and_trade")
-    global current_price # Ensure it uses the global current_price updated by get_current_price()
+    """현재 가격을 확인하고 거래를 실행합니다. 거래가 발생하면 True를 반환합니다."""
+    if current_price is None or current_price <= 0:
+        logger.warning("유효하지 않은 현재 가격으로 거래 로직 건너뜀.")
+        return False
 
-    # 현재 가격 업데이트 (check_price_and_trade 호출 전에 외부에서 get_current_price 호출)
-    # current_price = get_current_price() # 이미 run_trading 루프에서 호출됨
-    if current_price is None or current_price <= 0: # current_price 유효성 검사
-        logger.error("유효하지 않은 현재 가격으로 거래 로직을 실행할 수 없습니다.")
-        logger.info("/check_price_and_trade\n")
-        return
-
-    for i, grid in enumerate(grid_orders): # Iterate with index
-        level = grid['level'] # level for logging
-        
-        # 매수 조건: 현재 가격이 해당 그리드 구간 내에 있고 아직 매수되지 않은 경우
-        if (not grid['is_bought'] and 
-            grid['buy_price_min'] < current_price <= grid['buy_price_target']):
-            logger.info(f"레벨 {level} 매수 조건 충족: 현재가({current_price:,.2f}원)가 구간({grid['buy_price_min']:,.2f}~{grid['buy_price_target']:,.2f}원) 내에 있음")
-            buy_coin(level) # buy_coin expects level number (1-indexed)
-            time.sleep(1) # 주문 처리 간격
-
-        # 매도 조건: 현재 가격이 매도 목표가 이상이고 이미 매수된 경우
+    traded = False
+    for grid in grid_orders:
+        level = grid['level']
+        if not grid['is_bought'] and grid['buy_price_min'] < current_price <= grid['buy_price_target']:
+            logger.info(f"매수 조건 충족 (L{level}): 현재가({current_price:,.2f})가 구간({grid['buy_price_min']:,.2f}~{grid['buy_price_target']:,.2f}) 내 위치")
+            if buy_coin(level):
+                traded = True
+                time.sleep(1)
         elif grid['is_bought'] and current_price >= grid['sell_price_target']:
-            logger.info(f"레벨 {level} 매도 조건 충족: 현재가({current_price:,.2f}원) >= 매도 목표가({grid['sell_price_target']:,.2f}원)")
-            sell_coin(level) # sell_coin expects level number
-            time.sleep(1) # 주문 처리 간격
-            
-    logger.info("/check_price_and_trade\n")
-
+            logger.info(f"매도 조건 충족 (L{level}): 현재가({current_price:,.2f}) >= 매도 목표가({grid['sell_price_target']:,.2f})")
+            if sell_coin(level):
+                traded = True
+                time.sleep(1)
+    return traded
 
 def run_trading():
-    logger.info("run_trading")
-    global current_price, DISCORD_LOGGING
-
-    # 데이터베이스 초기화
+    """메인 거래 루프"""
     init_db()
-    
     logger.info(f"===== {TICKER} 자동 매매 시작 =====")
-    logger.info(f"티커: {TICKER}")
-    logger.info(f"차수별 주문 금액: {ORDER_AMOUNT:,}원")
-    logger.info(f"가격 변동 기준: {PRICE_CHANGE}원")
-    logger.info(f"최대 분할 차수: {MAX_GRID_COUNT}")
-    logger.info(f"가격 확인 간격: {CHECK_INTERVAL}초")
-    logger.info(f"거래 수수료율: {FEE_RATE * 100:.3f}%")
-    logger.info(f"Discord 로깅: {'활성화' if DISCORD_LOGGING else '비활성화'}")
+    discord_logger.send(f"===== {TICKER} 자동 매매 시작 =====")
 
-    try:
-        logger.info("실거래 모드 활성화됨")
-        # 현재가 조회 및 초기 자산 기록 (실거래 모드)
-        temp_current_price = get_current_price() # 초기 가격 조회
-        if temp_current_price is None:
-            logger.error("프로그램 시작 시 현재 가격 조회 실패. 종료합니다.")
-            return
+    if not create_grid_orders(BASE_PRICE):
+        logger.error("그리드 주문 생성 실패. 프로그램을 종료합니다.")
+        return
 
-        # BASE_PRICE가 설정되어 있으면 그 값을 사용, 없으면 현재가 사용
-        if BASE_PRICE is not None:
-            input_base_price_for_grid = BASE_PRICE
-            logger.info(f"현재 시장 가격: {temp_current_price:,.2f}원")
-            logger.info(f"그리드 기준 가격 설정 (사용자 지정): {input_base_price_for_grid:,.2f}원")
-        else:
-            input_base_price_for_grid = temp_current_price
-            logger.info(f"현재 시장 가격: {temp_current_price:,.2f}원")
-            logger.info(f"그리드 기준 가격 설정 (현재가 기준): {input_base_price_for_grid:,.2f}원")
+    logger.info("===== 매매 루프 시작 =====")
+    last_balance_save_time = 0
+    BALANCE_SAVE_INTERVAL = 120  # 120초(2분)마다 잔고 저장
 
-        if not create_grid_orders(input_base_price_for_grid):
-            logger.error("그리드 주문 생성 실패. 프로그램을 종료합니다.")
-            return
-
-        logger.info(f"===== 매매 루프 시작 =====")
-        cycle_count = 0
-        while True:
-            cycle_count = (cycle_count % 10000) + 1
-            logger.info(f"===== 사이클 #{cycle_count} =====")
+    while True:
+        if get_current_price() is not None:
+            traded = check_price_and_trade()
             
-            current_price = get_current_price() # 루프 시작 시 가격 업데이트
-            if current_price is None:
-                logger.warning("현재 가격 조회 실패. 다음 사이클까지 대기합니다.")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            check_price_and_trade() # 업데이트된 current_price 사용
-            
-            logger.info(f"{CHECK_INTERVAL}초 대기...")
-            get_balance()  # 이 부분이 주기적으로 실행되어야 함
-            time.sleep(CHECK_INTERVAL)
-
-    except KeyboardInterrupt:
-        logger.info("\n사용자에 의해 거래가 중단되었습니다.")
-    except Exception as e:
-        logger.error(f"\n거래 중 예외 발생: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-    finally:
-        logger.info("===== 거래 로직 종료 =====")
-        # 최종 잔고 상태 한번 더 확인 및 로깅
-        if current_price is None or current_price == 0: # 최종 결과 표시 위한 가격 확인
-            current_price = get_current_price() or 0 # 마지막 시도 또는 0
+            # 거래가 발생했거나, 일정 시간이 지났으면 잔고 저장
+            if traded or (time.time() - last_balance_save_time > BALANCE_SAVE_INTERVAL):
+                get_balance()
+                last_balance_save_time = time.time()
         
-        get_balance() # 최종 잔고 출력
-
-        buy_count = sum(1 for trade in trade_history if trade['type'] == 'buy')
-        sell_count = sum(1 for trade in trade_history if trade['type'] == 'sell')
-        logger.info(f"\n최종 거래 요약: 총 {buy_count + sell_count}회 체결 (매수: {buy_count}회, 매도: {sell_count}회)")
-
-    logger.info("/run_trading\n")
-
+        logger.info(f"{CHECK_INTERVAL}초 대기...")
+        time.sleep(CHECK_INTERVAL)
 
 def main() -> None:
-    """Run the trading bot."""
-    logger.info("거래 봇을 시작합니다.")
+    """인자 파싱 및 봇 실행"""
+    parser = argparse.ArgumentParser(description="Upbit Grid Trading Bot")
+    parser.add_argument("--ticker", type=str, required=True, help="거래할 티커 (예: KRW-BTC)")
+    args = parser.parse_args()
+
+    if not setup_application(args.ticker):
+        sys.exit(1)
+
+    # 현 세션 시작 시간 기록 (KST 시간대 포함)
+    try:
+        from datetime import timezone, timedelta
+        KST = timezone(timedelta(hours=9))
+        
+        path_config = PathConfig(args.ticker)
+        session_file = path_config.get_session_filename()
+        with open(session_file, 'w', encoding='utf-8') as f:
+            f.write(datetime.now(KST).isoformat())
+        logger.info(f"세션 시작 시간 기록 완료: {session_file}")
+    except Exception as e:
+        logger.error(f"세션 시작 시간 기록 실패: {e}")
+
     try:
         run_trading()
     except KeyboardInterrupt:
-        logger.info("프로그램을 종료합니다.")
+        logger.info("사용자에 의해 프로그램이 중단되었습니다.")
+        discord_logger.send(f"{TICKER} 거래가 사용자에 의해 중단되었습니다.", "WARNING")
     except Exception as e:
-        logger.error(f"오류 발생: {str(e)}")
-        sys.exit(1)
+        logger.critical(f"치명적인 오류 발생: {e}", exc_info=True)
+        discord_logger.send(f"{TICKER} 거래 중 치명적인 오류 발생: {e}", "CRITICAL")
+    finally:
+        logger.info("===== 거래 로직 종료 =====")
+        get_balance()
 
 if __name__ == "__main__":
     main()
