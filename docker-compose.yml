@@ -64,6 +64,7 @@ services:
     eth_dashboard:
         build: .
         container_name: eth_dashboard_service
+        hostname: eth_dashboard
         # --- CRITICAL CHANGE HERE ---
         command:
             [

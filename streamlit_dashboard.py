@@ -109,8 +109,11 @@ def display_processed_tables(grid_df: pd.DataFrame, trades_df: pd.DataFrame):
     if grid_df is None or grid_df.empty:
         st.info("그리드 정보가 없습니다.")
     else:
-        # 각 grid_level의 최신 데이터만 선택
-        latest_grid_df = grid_df.loc[grid_df.groupby('grid_level')['timestamp'].idxmax()]
+        # grid_level별로 가장 최신 상태를 정확히 반영하도록 로직 수정
+        # 1. 시간순으로 정렬
+        grid_df_sorted = grid_df.sort_values('timestamp')
+        # 2. grid_level별로 마지막(최신) 데이터만 남김
+        latest_grid_df = grid_df_sorted.drop_duplicates(subset='grid_level', keep='last')
         
         grid_display_df = pd.DataFrame({
             "구간": latest_grid_df['grid_level'],
@@ -203,7 +206,7 @@ def display_summary_and_analysis(grid_df: pd.DataFrame, trades_df: pd.DataFrame,
         st.markdown("##### B. 최근 거래 동향 (지난 24시간)")
         if not trades_df.empty:
             trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
-            now = pd.Timestamp.now(tz=KST)
+            now = pd.Timestamp.now(tz=KST).tz_localize(None)
             recent_trades = trades_df[trades_df['timestamp'] >= now - timedelta(hours=24)]
 
             if not recent_trades.empty:
