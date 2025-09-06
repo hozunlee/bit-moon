@@ -105,7 +105,7 @@ def display_processed_tables(grid_df: pd.DataFrame, trades_df: pd.DataFrame):
     st.markdown("---")
     
     # --- 그리드 현황 ---
-    st.subheader("🔲 그리드 현황")
+    st.subheader("🔲 그리드 상세 현황")
     if grid_df is None or grid_df.empty:
         st.info("그리드 정보가 없습니다.")
     else:
@@ -140,6 +140,90 @@ def display_processed_tables(grid_df: pd.DataFrame, trades_df: pd.DataFrame):
         }).set_index("시간")
         st.dataframe(trades_display_df.head(15), use_container_width=True)
 
+# --- 신규 분석 섹션 ---
+def display_summary_and_analysis(grid_df: pd.DataFrame, trades_df: pd.DataFrame, balance_df: pd.DataFrame):
+    st.markdown("---")
+    st.subheader("💡 요약 및 기술적 분석")
+
+    if grid_df.empty and trades_df.empty and balance_df.empty:
+        st.info("분석할 데이터가 부족합니다.")
+        return
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # --- A. 그리드 요약 ---
+        st.markdown("##### A. 그리드 요약")
+        if not grid_df.empty:
+            latest_grid_df = grid_df.loc[grid_df.groupby('grid_level')['timestamp'].idxmax()]
+            total_grids = len(latest_grid_df)
+            bought_grids = latest_grid_df['is_bought'].sum()
+            waiting_grids = total_grids - bought_grids
+            bought_ratio = bought_grids / total_grids if total_grids > 0 else 0
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("총 그리드", f"{total_grids} 개")
+            c2.metric("🟢 보유", f"{bought_grids} 개")
+            c3.metric("⚪ 대기", f"{waiting_grids} 개")
+            st.progress(bought_ratio, text=f"자본 투입률: {bought_ratio:.1%}")
+        else:
+            st.info("그리드 데이터가 없습니다.")
+
+        # --- C. 시장 동향 기술적 분석 ---
+        st.markdown("##### C. 시장 동향 기술적 분석")
+        if not balance_df.empty and len(balance_df) > 10: # 최소 데이터 포인트 확보
+            balance_df['timestamp'] = pd.to_datetime(balance_df['timestamp'])
+            now = pd.Timestamp.now(tz=KST)
+            
+            # 최근 1시간, 6시간 데이터 필터링
+            recent_1h = balance_df[balance_df['timestamp'] >= now - timedelta(hours=1)]
+            recent_6h = balance_df[balance_df['timestamp'] >= now - timedelta(hours=6)]
+
+            if not recent_1h.empty and not recent_6h.empty:
+                short_sma = recent_1h['current_price'].mean()
+                long_sma = recent_6h['current_price'].mean()
+                volatility = recent_1h['current_price'].std()
+
+                trend = "횡보 (낮은 변동성)"
+                if short_sma > long_sma * 1.01:
+                    trend = "📈 상승 추세"
+                elif short_sma < long_sma * 0.99:
+                    trend = "📉 하락 추세"
+                elif volatility > short_sma * 0.01: # 변동성이 평균 가격의 1% 이상이면
+                    trend = "횡보 (높은 변동성)"
+                
+                st.metric("현재 시장 동향", trend, help="단기(1h) 및 장기(6h) 이동평균선과 변동성을 기반으로 분석됩니다.")
+            else:
+                st.info("추세 분석을 위한 데이터가 부족합니다.")
+        else:
+            st.info("가격 기록이 부족하여 추세를 분석할 수 없습니다.")
+
+    with col2:
+        # --- B. 최근 거래 동향 ---
+        st.markdown("##### B. 최근 거래 동향 (지난 24시간)")
+        if not trades_df.empty:
+            trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+            now = pd.Timestamp.now(tz=KST)
+            recent_trades = trades_df[trades_df['timestamp'] >= now - timedelta(hours=24)]
+
+            if not recent_trades.empty:
+                buy_trades = recent_trades[recent_trades['buy_sell'] == 'buy']['amount'].sum()
+                sell_trades = recent_trades[recent_trades['buy_sell'] == 'sell']['amount'].sum()
+
+                st.text(f"총 매수액: {buy_trades:,.0f} 원")
+                st.text(f"총 매도액: {sell_trades:,.0f} 원")
+
+                # 시각화를 위한 데이터프레임 생성
+                flow_data = pd.DataFrame({
+                    "거래 종류": ["매수", "매도"],
+                    "체결액 (원)": [buy_trades, sell_trades]
+                }).set_index("거래 종류")
+                
+                st.bar_chart(flow_data, color=["#3388ff", "#ff3344"]) # 파란색, 빨간색
+            else:
+                st.info("지난 24시간 동안 거래가 없습니다.")
+        else:
+            st.info("거래 데이터가 없습니다.")
 
 def display_footer_status(first_start_time: Optional[datetime], session_start_time: Optional[datetime]):
     st.markdown("<br><br>", unsafe_allow_html=True)
@@ -190,6 +274,7 @@ def main(ticker: str):
             
             display_kpi_metrics(trades_df, balance_df, grid_df, ticker)
             display_processed_tables(grid_df, trades_df)
+            display_summary_and_analysis(grid_df, trades_df, balance_df)
 
             first_start_time = get_first_start_time(ticker)
             session_start_time = get_session_start_time(ticker)
