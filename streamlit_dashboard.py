@@ -109,6 +109,9 @@ def display_processed_tables(grid_df: pd.DataFrame, trades_df: pd.DataFrame):
     if grid_df is None or grid_df.empty:
         st.info("그리드 정보가 없습니다.")
     else:
+        # [수정] timestamp를 datetime으로 변환하여 정렬 정확도 향상
+        grid_df['timestamp'] = pd.to_datetime(grid_df['timestamp'])
+        
         # grid_level별로 가장 최신 상태를 정확히 반영하도록 로직 수정
         # 1. 시간순으로 정렬
         grid_df_sorted = grid_df.sort_values('timestamp')
@@ -216,13 +219,12 @@ def display_summary_and_analysis(grid_df: pd.DataFrame, trades_df: pd.DataFrame,
                 st.text(f"총 매수액: {buy_trades:,.0f} 원")
                 st.text(f"총 매도액: {sell_trades:,.0f} 원")
 
-                # 시각화를 위한 데이터프레임 생성
-                flow_data = pd.DataFrame({
-                    "거래 종류": ["매수", "매도"],
-                    "체결액 (원)": [buy_trades, sell_trades]
-                }).set_index("거래 종류")
-                
-                st.bar_chart(flow_data, color=["#3388ff", "#ff3344"]) # 파란색, 빨간색
+                # 시각화를 위한 데이터프레임 구조 변경
+                chart_data = pd.DataFrame({
+                    "매수": [buy_trades],
+                    "매도": [sell_trades]
+                })
+                st.bar_chart(chart_data, color=["#3388ff", "#ff3344"]) # 파란색, 빨간색
             else:
                 st.info("지난 24시간 동안 거래가 없습니다.")
         else:
