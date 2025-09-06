@@ -175,7 +175,7 @@ def display_summary_and_analysis(grid_df: pd.DataFrame, trades_df: pd.DataFrame,
         # --- C. 시장 동향 기술적 분석 ---
         st.markdown("##### C. 시장 동향 기술적 분석")
         if not balance_df.empty and len(balance_df) > 10: # 최소 데이터 포인트 확보
-            balance_df['timestamp'] = pd.to_datetime(balance_df['timestamp'])
+            balance_df['timestamp'] = pd.to_datetime(balance_df['timestamp']).dt.tz_localize('UTC').dt.tz_convert(KST)
             now = pd.Timestamp.now(tz=KST)
             
             # 최근 1시간, 6시간 데이터 필터링
