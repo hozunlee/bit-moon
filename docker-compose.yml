@@ -1,78 +1,111 @@
-version: '3.8'
-
 services:
-  # --- 비트코인(BTC) 서비스 ---
-  btc_app:
-    build: .
-    container_name: btc_app_service
-    command: ["python", "product_app.py", "--ticker", "KRW-BTC"]
-    restart: unless-stopped
-    environment:
-      - UPBIT_ACCESS_KEY=${BTC_UPBIT_ACCESS_KEY}
-      - UPBIT_SECRET_KEY=${BTC_UPBIT_SECRET_KEY}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
-      - TZ=Asia/Seoul
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./config:/app/config
-    networks:
-      - crypto-network
+    # --- 비트코인(BTC) 서비스 ---
+    btc_app:
+        build: .
+        container_name: btc_app_service
+        command: ["python", "product_app.py", "--ticker", "KRW-BTC"]
+        restart: unless-stopped
+        environment:
+            - UPBIT_ACCESS_KEY=${BTC_UPBIT_ACCESS_KEY}
+            - UPBIT_SECRET_KEY=${BTC_UPBIT_SECRET_KEY}
+            - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+            - TZ=Asia/Seoul
+        volumes:
+            - ./data:/app/data
+            - ./logs:/app/logs
+            - ./config:/app/config
+        networks:
+            - crypto-network
 
-  btc_dashboard:
-    build: .
-    container_name: btc_dashboard_service
-    command: ["streamlit", "run", "streamlit_dashboard.py", "--", "--ticker", "KRW-BTC"]
-    restart: unless-stopped
-    ports:
-      - "8501:8501" # BTC 대시보드는 8501 포트로 접속
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./config:/app/config
-    networks:
-      - crypto-network
-    depends_on:
-      - btc_app
+    btc_dashboard:
+        build: .
+        container_name: btc_dashboard_service
+        # --- CRITICAL CHANGE HERE ---
+        command:
+            [
+                "streamlit",
+                "run",
+                "streamlit_dashboard.py",
+                "--server.port=8501",
+                "--server.headless=true",
+                "--server.baseUrlPath=/btc/",
+                "--",
+                "--ticker",
+                "KRW-BTC",
+            ]
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data
+            - ./logs:/app/logs
+            - ./config:/app/config
+        networks:
+            - crypto-network
+        depends_on:
+            - btc_app
 
-  # --- 이더리움(ETH) 서비스 ---
-  eth_app:
-    build: .
-    container_name: eth_app_service
-    command: ["python", "product_app.py", "--ticker", "KRW-ETH"]
-    restart: unless-stopped
-    environment:
-      - UPBIT_ACCESS_KEY=${ETH_UPBIT_ACCESS_KEY}
-      - UPBIT_SECRET_KEY=${ETH_UPBIT_SECRET_KEY}
-      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
-      - TZ=Asia/Seoul
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./config:/app/config
-    networks:
-      - crypto-network
+    # --- 이더리움(ETH) 서비스 ---
+    eth_app:
+        build: .
+        container_name: eth_app_service
+        command: ["python", "product_app.py", "--ticker", "KRW-ETH"]
+        restart: unless-stopped
+        environment:
+            - UPBIT_ACCESS_KEY=${ETH_UPBIT_ACCESS_KEY}
+            - UPBIT_SECRET_KEY=${ETH_UPBIT_SECRET_KEY}
+            - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+            - TZ=Asia/Seoul
+        volumes:
+            - ./data:/app/data
+            - ./logs:/app/logs
+            - ./config:/app/config
+        networks:
+            - crypto-network
 
-  eth_dashboard:
-    build: .
-    container_name: eth_dashboard_service
-    command: ["streamlit", "run", "streamlit_dashboard.py", "--", "--ticker", "KRW-ETH"]
-    restart: unless-stopped
-    ports:
-      - "8502:8501" # ETH 대시보드는 8502 포트로 접속 (내부 포트는 8501)
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./config:/app/config
-    networks:
-      - crypto-network
-    depends_on:
-      - eth_app
+    eth_dashboard:
+        build: .
+        container_name: eth_dashboard_service
+        # --- CRITICAL CHANGE HERE ---
+        command:
+            [
+                "streamlit",
+                "run",
+                "streamlit_dashboard.py",
+                "--server.port=8501",
+                "--server.headless=true",
+                "--server.baseUrlPath=/eth/",
+                "--",
+                "--ticker",
+                "KRW-ETH",
+            ]
+        restart: unless-stopped
+        volumes:
+            - ./data:/app/data
+            - ./logs:/app/logs
+            - ./config:/app/config
+        networks:
+            - crypto-network
+        depends_on:
+            - eth_app
+
+    # --- Nginx 리버스 프록시 서비스 ---
+    nginx:
+        image: nginx:latest
+        container_name: reverse_proxy
+        restart: unless-stopped
+        ports:
+            - "80:80"
+        volumes:
+            - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+        networks:
+            - crypto-network
+        depends_on:
+            - btc_dashboard
+            - eth_dashboard
 
 networks:
-  crypto-network:
-    driver: bridge
+    crypto-network:
+        driver: bridge
 
 volumes:
-  crypto-data:
-  crypto-logs:
+    crypto-data:
+    crypto-logs:
